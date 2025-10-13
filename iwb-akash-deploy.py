@@ -46,9 +46,11 @@ class AkashDeployer:
         self.wallet_address = None
         self.wallet_mnemonic = None
         self.balance_uakt = 0
-        self.akash_node = self._select_fastest_rpc_node()
+        self.akash_node = None  # Will be set after logger initialization
         self.logger = self._setup_logging()
         self.state_file = self._get_state_file()
+        # Now select RPC node with proper logging
+        self.akash_node = self._select_fastest_rpc_node()
 
     def _setup_logging(self):
         log_file = self._get_log_file_path()
@@ -83,7 +85,8 @@ class AkashDeployer:
             return Path("./active-deployment.json")
 
     def _select_fastest_rpc_node(self):
-        print("🔍 Testing RPC nodes...")  # Use print since logger might not exist yet
+        """Select fastest RPC node with proper logging"""
+        self.logger.info("🔍 Testing RPC node connectivity and speed...")
         
         def test_rpc_functionality(node_url, timeout=8):
             try:
@@ -100,18 +103,17 @@ class AkashDeployer:
                 
                 if result.returncode == 0:
                     elapsed = time.time() - start
-                    print(f"  ✅ {node_url}: {elapsed:.3f}s (functional)")
                     return elapsed
                 else:
-                    print(f"  ❌ {node_url}: Query failed")
                     return float('inf')
                     
             except Exception as e:
-                print(f"  ❌ {node_url}: {str(e)[:50]}")
                 return float('inf')
 
         # Test nodes concurrently
         working_nodes = {}
+        failed_nodes = []
+        
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(AKASH_RPC_NODES)) as executor:
             futures = {executor.submit(test_rpc_functionality, node): node for node in AKASH_RPC_NODES}
             
@@ -121,20 +123,28 @@ class AkashDeployer:
                     response_time = future.result()
                     if response_time < float('inf'):
                         working_nodes[node] = response_time
+                        if self.debug_mode:
+                            self.logger.debug(f"  ✅ {node}: {response_time:.3f}s")
+                    else:
+                        failed_nodes.append(node)
+                        if self.debug_mode:
+                            self.logger.debug(f"  ❌ {node}: Not responding")
                 except Exception as e:
-                    print(f"  ❌ {node}: Test failed - {e}")
+                    failed_nodes.append(node)
+                    if self.debug_mode:
+                        self.logger.debug(f"  ❌ {node}: {str(e)[:50]}")
 
         if working_nodes:
             # Select fastest working node
             selected_node = min(working_nodes.keys(), key=lambda x: working_nodes[x])
-            print(f"✅ Selected working RPC node: {selected_node} ({working_nodes[selected_node]:.3f}s)")
-            if hasattr(self, 'logger'):
-                self.logger.info(f"✅ Selected working RPC node: {selected_node}")
+            self.logger.info(f"✅ Selected RPC node: {selected_node} ({working_nodes[selected_node]:.3f}s, {len(working_nodes)}/{len(AKASH_RPC_NODES)} nodes working)")
+            
+            if self.debug_mode and failed_nodes:
+                self.logger.debug(f"   Failed nodes: {', '.join([n.split('//')[1].split(':')[0] for n in failed_nodes])}")
+            
             return selected_node
         else:
-            print(f"⚠️  No working RPC nodes found, using fallback: {AKASH_NODE_FALLBACK}")
-            if hasattr(self, 'logger'):
-                self.logger.warning(f"⚠️  No working RPC nodes found, using fallback: {AKASH_NODE_FALLBACK}")
+            self.logger.warning(f"⚠️  All RPC nodes failed, using fallback: {AKASH_NODE_FALLBACK}")
             return AKASH_NODE_FALLBACK
 
     def run_command(self, cmd, timeout=30, env=None):
@@ -230,20 +240,26 @@ class AkashDeployer:
         self.logger.info("🔐 Restoring wallet from backup...")
         
         # Check if wallet exists
+        if self.debug_mode:
+            self.logger.debug(f"   Checking for existing wallet: {AKASH_WALLET_NAME}")
+        
         success, result = self.execute_query(['keys', 'list', '--output', 'json'])
         if success and isinstance(result, list):
             for key in result:
                 if key.get('name') == AKASH_WALLET_NAME:
-                    self.wallet_address, self.balance_uakt = key.get('address'), self.get_wallet_balance()
-                    self.logger.info("✅ Wallet already exists")
+                    self.wallet_address = key.get('address')
+                    self.logger.info(f"✅ Wallet already exists: {self.wallet_address}")
+                    self.balance_uakt = self.get_wallet_balance()
                     return True
 
-        # Try restoration
+        # Try restoration from Storj
+        self.logger.info("   Wallet not found in keyring, restoring from Storj backup...")
+        
         try:
             storj_bucket = os.getenv('IWB_STORJ_WPOPS_BUCKET')
             domain = os.getenv('IWB_DOMAIN')
             if not all([storj_bucket, domain]):
-                self.logger.error("❌ Missing Storj environment variables")
+                self.logger.error("❌ Missing Storj environment variables (IWB_STORJ_WPOPS_BUCKET, IWB_DOMAIN)")
                 return False
 
             # Download and extract backup
@@ -253,25 +269,38 @@ class AkashDeployer:
             os.makedirs(temp_dir, exist_ok=True)
 
             # Download
+            if self.debug_mode:
+                self.logger.debug(f"   Downloading backup from: {storj_path}")
+            
             stdout, stderr, rc = self.run_command(['uplink', 'cp', storj_path, f"{temp_dir}/{backup_filename}"], 60)
             if rc != 0:
+                self.logger.error(f"❌ Failed to download backup from Storj: {stderr}")
                 return False
 
             # Extract
+            if self.debug_mode:
+                self.logger.debug(f"   Extracting backup archive...")
+            
             stdout, stderr, rc = self.run_command(['tar', '-xzf', f"{temp_dir}/{backup_filename}", '-C', temp_dir], 30)
             if rc != 0:
+                self.logger.error(f"❌ Failed to extract backup: {stderr}")
                 return False
 
             # Read wallet data
             wallet_file = f"{temp_dir}/{compose_project}_akash-deploy-backup.json"
+            if self.debug_mode:
+                self.logger.debug(f"   Reading wallet data from: {wallet_file}")
+            
             with open(wallet_file, 'r') as f:
                 wallet_data = json.load(f)
 
             mnemonic = wallet_data.get('mnemonic')
             if not mnemonic:
+                self.logger.error("❌ No mnemonic found in backup file")
                 return False
 
             # Restore wallet (securely - don't log mnemonic)
+            self.logger.info("   Importing wallet into keyring...")
             if self.debug_mode:
                 self.logger.debug("🔧 Executing: provider-services keys add [WALLET_NAME] --recover --keyring-backend test --interactive=false (mnemonic passed securely via stdin)")
             
@@ -287,26 +316,41 @@ class AkashDeployer:
                 )
                 stdout, stderr = process.communicate(input=mnemonic, timeout=30)
                 rc = process.returncode
+                
+                if rc != 0:
+                    self.logger.error(f"❌ Wallet import failed: {stderr}")
+                    return False
+                    
             except subprocess.TimeoutExpired:
                 if process:
                     process.kill()
-                stdout, stderr, rc = "", "Wallet restoration timed out", -1
+                self.logger.error("❌ Wallet restoration timed out")
+                return False
             except Exception as e:
-                stdout, stderr, rc = "", f"Wallet restoration failed: {e}", -1
+                self.logger.error(f"❌ Wallet restoration failed: {e}")
+                return False
 
             # Get wallet address from backup or query keyring
             self.wallet_address = wallet_data.get('address')
             if not self.wallet_address:
+                if self.debug_mode:
+                    self.logger.debug("   Querying keyring for wallet address...")
                 success, result = self.execute_query(['keys', 'show', AKASH_WALLET_NAME, '--output', 'json'])
                 if success and isinstance(result, dict):
                     self.wallet_address = result.get('address')
 
+            self.logger.info(f"✅ Wallet restored successfully: {self.wallet_address}")
+            
             # Cleanup
+            if self.debug_mode:
+                self.logger.debug("   Cleaning up temporary files...")
             self.run_command(['rm', '-rf', temp_dir], 10)
             return True
 
         except Exception as e:
             self.logger.error(f"❌ Wallet restoration failed: {e}")
+            if self.debug_mode:
+                self.logger.debug(f"   Exception details: {traceback.format_exc()}")
             return False
 
     def cleanup_wallet(self):
@@ -352,15 +396,23 @@ class AkashDeployer:
 
     def setup_certificate(self):
         """Setup certificate"""
-        success, result = self.execute_query(['query', 'cert', 'list'])
+        self.logger.info("🔐 Checking certificate status...")
+        
+        # Query certificates for this wallet only
+        success, result = self.execute_query(['query', 'cert', 'list', '--owner', self.wallet_address])
         if success and isinstance(result, dict) and result.get('certificates'):
-            self.logger.info("✅ Certificate already published")
+            cert_count = len(result.get('certificates', []))
+            self.logger.info(f"✅ Certificate already published ({cert_count} certificate(s) found for this wallet)")
             return True
         
-        success, _, _ = self.execute_tx(['tx', 'cert', 'publish', 'client'])
+        self.logger.info("   Publishing new certificate to blockchain...")
+        success, stdout, stderr = self.execute_tx(['tx', 'cert', 'publish', 'client'])
         if success:
-            self.logger.info("✅ Certificate published")
-        return success
+            self.logger.info("✅ Certificate published successfully")
+            return True
+        else:
+            self.logger.error(f"❌ Certificate publication failed: {stderr}")
+            return False
 
     def create_deployment_manifest(self, api_credentials):
         """Return path to manifest file - use provided file from n8n or yaml content directly"""
@@ -1098,13 +1150,37 @@ class AkashDeployer:
                 }
 
             if not self.restore_wallet():
-                return {'success': False, 'error': 'Wallet restoration failed'}
+                return {
+                    'success': False,
+                    'message': 'Deployment failed',
+                    'error': 'Wallet restoration failed',
+                    'deployment_info': None,
+                    'lease_info': None,
+                    'service_url': None,
+                    'api_credentials': None
+                }
 
             if self.get_wallet_balance() < 1000000:
-                return {'success': False, 'error': 'Insufficient balance'}
+                return {
+                    'success': False,
+                    'message': 'Deployment failed',
+                    'error': 'Insufficient balance',
+                    'deployment_info': None,
+                    'lease_info': None,
+                    'service_url': None,
+                    'api_credentials': None
+                }
 
             if not self.setup_certificate():
-                return {'success': False, 'error': 'Certificate setup failed'}
+                return {
+                    'success': False,
+                    'message': 'Deployment failed',
+                    'error': 'Certificate setup failed',
+                    'deployment_info': None,
+                    'lease_info': None,
+                    'service_url': None,
+                    'api_credentials': None
+                }
 
             # Create deployment
             result = self.create_deployment()
@@ -1116,7 +1192,15 @@ class AkashDeployer:
             # Wait for bids
             bids = self.wait_for_bids(dseq)
             if not bids:
-                return {'success': False, 'error': 'No bids received'}
+                return {
+                    'success': False,
+                    'message': 'Deployment failed',
+                    'error': 'No bids received',
+                    'deployment_info': result.get('deployment_info'),
+                    'lease_info': None,
+                    'service_url': None,
+                    'api_credentials': None
+                }
 
             # Create lease
             best_bid = self.select_best_bid(bids)
@@ -1129,15 +1213,39 @@ class AkashDeployer:
             # Send manifest and wait
             manifest_path = result['deployment_info'].get('manifest_path')
             if not manifest_path:
-                return {'success': False, 'error': 'Manifest path not found in deployment info'}
+                return {
+                    'success': False,
+                    'message': 'Deployment failed',
+                    'error': 'Manifest path not found in deployment info',
+                    'deployment_info': result.get('deployment_info'),
+                    'lease_info': lease_result.get('lease_info'),
+                    'service_url': None,
+                    'api_credentials': None
+                }
             
             manifest_result = self.send_manifest(manifest_path, dseq)
             if not manifest_result['success']:
-                return {'success': False, 'error': f"Manifest send failed: {manifest_result.get('error', 'Unknown error')}"}
+                return {
+                    'success': False,
+                    'message': 'Deployment failed',
+                    'error': f"Manifest send failed: {manifest_result.get('error', 'Unknown error')}",
+                    'deployment_info': result.get('deployment_info'),
+                    'lease_info': lease_result.get('lease_info'),
+                    'service_url': None,
+                    'api_credentials': None
+                }
 
             service_url = self.wait_for_ready(dseq, provider)
             if not service_url:
-                return {'success': False, 'error': 'Service failed to become ready'}
+                return {
+                    'success': False,
+                    'message': 'Deployment failed',
+                    'error': 'Service failed to become ready',
+                    'deployment_info': result.get('deployment_info'),
+                    'lease_info': lease_result.get('lease_info'),
+                    'service_url': None,
+                    'api_credentials': None
+                }
 
             # Generate final API credentials with service URL
             api_credentials = self.generate_api_credentials(service_url)
@@ -1183,7 +1291,15 @@ The deployment is ready to use.
 
         except Exception as e:
             self.logger.error(f"❌ Deployment failed: {e}")
-            return {'success': False, 'error': str(e)}
+            return {
+                'success': False,
+                'message': 'Deployment failed with exception',
+                'error': str(e),
+                'deployment_info': None,
+                'lease_info': None,
+                'service_url': None,
+                'api_credentials': None
+            }
 
     def close_deployment(self, dseq=None):
         """Close deployment"""
@@ -1382,18 +1498,54 @@ Deployment closed and wallet cleaned up.
                     'error': 'Wallet restoration failed'
                 }
 
+            # Check balance
+            balance_sufficient = self.get_wallet_balance() > 1000000
+            
+            # Check certificate with proper logging
+            self.logger.info("🔐 Checking certificate status...")
+            cert_success, cert_result = self.execute_query(['query', 'cert', 'list', '--owner', self.wallet_address])
+            cert_exists = False
+            if cert_success and isinstance(cert_result, dict) and cert_result.get('certificates'):
+                cert_count = len(cert_result.get('certificates', []))
+                self.logger.info(f"✅ Certificate check passed ({cert_count} certificate(s) found for this wallet)")
+                cert_exists = True
+            else:
+                self.logger.warning("⚠️  No certificates found for this wallet (will need to publish before deployment)")
+                cert_exists = False
+
             checks = {
                 'wallet': True,
-                'balance': self.get_wallet_balance() > 1000000,
-                'certificate': self.execute_query(['query', 'cert', 'list'])[0],
-                'rpc_node': bool(self.akash_node)  # Just check that we have a valid RPC node
+                'balance': balance_sufficient,
+                'certificate': cert_exists,
+                'rpc_node': bool(self.akash_node)
             }
 
+            # Create consistent output structure with production, using placeholders for dry-run
             result = {
                 'success': all(checks.values()),
-                'message': 'Configuration validated successfully' if all(checks.values()) else 'Configuration issues found',
+                'message': 'Configuration validated successfully (dry-run)' if all(checks.values()) else 'Configuration issues found',
+                'deployment_info': {
+                    'dseq': None,
+                    'owner': self.wallet_address,
+                    'manifest_path': None
+                },
+                'lease_info': {
+                    'provider': None,
+                    'gseq': None,
+                    'oseq': None
+                },
+                'service_url': None,
+                'api_credentials': {
+                    'username': None,
+                    'password': None,
+                    'api_url': None
+                },
                 'validation_results': checks,
-                'cost_estimate': {'estimated_cost_akt': 0.5, 'current_balance_akt': self.balance_uakt / 1000000, 'sufficient_funds': checks['balance']}
+                'cost_estimate': {
+                    'estimated_cost_akt': 0.5,
+                    'current_balance_akt': self.balance_uakt / 1000000,
+                    'sufficient_funds': checks['balance']
+                }
             }
             
             return result
@@ -1416,12 +1568,29 @@ def main():
 
     args = parser.parse_args()
 
-    has_action = any([args.rpc_info, args.dry_run, args.close, args.status, args.logs, args.shell])
+    # Determine which actions don't require YAML
+    query_actions = [args.rpc_info, args.close, args.status, args.logs, args.shell]
+    deployment_actions = [args.dry_run, (not any(query_actions))]  # dry-run or production deploy
+    
+    has_query_action = any(query_actions)
+    has_deployment_action = any(deployment_actions)
     has_yaml = any([args.yaml, args.yaml_file])
     
-    if not has_action and not has_yaml:
+    # Show help if no arguments
+    if not has_query_action and not has_deployment_action:
         parser.print_help()
         sys.exit(0)
+    
+    # Require YAML for deployment actions (dry-run or production)
+    if has_deployment_action and not has_yaml:
+        error_result = {
+            'success': False,
+            'error': 'YAML manifest required for deployment. Use -f <file> or -y <yaml_content>',
+            'message': 'Missing required YAML manifest'
+        }
+        print(json.dumps(error_result, indent=2), file=sys.stderr)
+        parser.print_help()
+        sys.exit(1)
 
     deployer = AkashDeployer(debug_mode=args.debug, yaml_content=args.yaml, yaml_file=args.yaml_file)
 
@@ -1440,6 +1609,7 @@ def main():
             # Note: get_interactive_shell() uses os.execvp and won't return
             result = deployer.get_interactive_shell()
         else:
+            # Production deployment
             result = deployer.run()
 
         print(json.dumps(result, indent=2))
