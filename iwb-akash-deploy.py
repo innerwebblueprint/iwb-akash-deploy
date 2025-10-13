@@ -1,0 +1,1454 @@
+#!/usr/bin/env python3
+"""
+iwb-akash-deploy.py - Compact Akash Deployment Script
+Deploy ComfyUI instances to Akash Network for n8n workflows
+"""
+
+__version__ = "1.0.0"
+
+import os, sys, json, subprocess, time, secrets, string, argparse, requests, concurrent.futures
+import stat, shutil, traceback, logging, yaml, tempfile
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Optional, Tuple, List, Any
+from pathlib import Path
+
+# Configuration
+compose_project = os.getenv('COMPOSE_PROJECT_NAME')
+if not compose_project:
+    print("Environment variables available:")
+    for key in sorted(os.environ.keys()):
+        if 'COMPOSE' in key:
+            print(f"  {key}={os.environ[key]}")
+    raise ValueError("COMPOSE_PROJECT_NAME environment variable must be set. Use 'export COMPOSE_PROJECT_NAME=your_value' in your shell.")
+
+AKASH_WALLET_NAME = compose_project + 'akashwallet'
+AKASH_KEYRING_BACKEND = 'test'
+AKASH_CHAIN_ID = 'akashnet-2'
+AKASH_RPC_NODES = [
+    'https://rpc.akashnet.net:443',
+    'https://rpc-akash.ecostake.com:443',
+    'https://akash-rpc.polkachu.com:443',
+    'https://akash.c29r3.xyz:443/rpc',
+    'https://akash-rpc.europlots.com:443'
+]
+AKASH_NODE_FALLBACK = 'https://rpc.akashnet.net:443'
+COMFYUI_PORT = 8188
+DEFAULT_GAS_CONFIG = {'gas': 'auto', 'gas_adjustment': '1.75', 'gas_prices': '0.025uakt'}
+
+class AkashDeployer:
+    """Main deployer class - compact version"""
+    
+    def __init__(self, debug_mode=False, dseq=None, yaml_content=None, yaml_file=None):
+        self.debug_mode = debug_mode
+        self.dseq = dseq
+        self.yaml_content = yaml_content
+        self.yaml_file = yaml_file
+        self.wallet_address = None
+        self.wallet_mnemonic = None
+        self.balance_uakt = 0
+        self.akash_node = self._select_fastest_rpc_node()
+        self.logger = self._setup_logging()
+        self.state_file = self._get_state_file()
+
+    def _setup_logging(self):
+        log_file = self._get_log_file_path()
+        level = logging.DEBUG if self.debug_mode else logging.INFO
+        handlers: List[logging.Handler] = [logging.FileHandler(log_file, mode='a')]
+        if self.debug_mode:
+            handlers.append(logging.StreamHandler(sys.stderr))
+        logging.basicConfig(level=level, format='%(asctime)s - %(levelname)s - %(message)s', handlers=handlers)
+        logger = logging.getLogger(__name__)
+        logger.info("=" * 50)
+        return logger
+
+    def _get_log_file_path(self):
+        try:
+            log_dir = Path("/var/log/akash-deploy")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_dir.chmod(stat.S_IRWXU | stat.S_IRWXG | stat.S_IROTH | stat.S_IXOTH)
+            base_dir = log_dir
+        except (PermissionError, OSError):
+            base_dir = Path(".")
+        
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        suffix = f"_{self.dseq}" if self.dseq else ""
+        return str(base_dir / f"iwb-akash-deploy_{timestamp}{suffix}.log")
+
+    def _get_state_file(self):
+        try:
+            primary = Path("/var/log/akash-deploy/active-deployment.json")
+            primary.parent.mkdir(parents=True, exist_ok=True)
+            return primary
+        except (PermissionError, OSError):
+            return Path("./active-deployment.json")
+
+    def _select_fastest_rpc_node(self):
+        print("🔍 Testing RPC nodes...")  # Use print since logger might not exist yet
+        
+        def test_rpc_functionality(node_url, timeout=8):
+            try:
+                # First test basic connectivity
+                start = time.time()
+                response = requests.get(f"{node_url}/status", timeout=3)
+                if response.status_code != 200:
+                    return float('inf')
+                
+                # Then test actual blockchain query functionality
+                # Use a simple query that should work on any Akash node
+                test_cmd = ['provider-services', 'query', 'block', '--node', node_url]
+                result = subprocess.run(test_cmd, capture_output=True, text=True, timeout=timeout)
+                
+                if result.returncode == 0:
+                    elapsed = time.time() - start
+                    print(f"  ✅ {node_url}: {elapsed:.3f}s (functional)")
+                    return elapsed
+                else:
+                    print(f"  ❌ {node_url}: Query failed")
+                    return float('inf')
+                    
+            except Exception as e:
+                print(f"  ❌ {node_url}: {str(e)[:50]}")
+                return float('inf')
+
+        # Test nodes concurrently
+        working_nodes = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(AKASH_RPC_NODES)) as executor:
+            futures = {executor.submit(test_rpc_functionality, node): node for node in AKASH_RPC_NODES}
+            
+            for future in concurrent.futures.as_completed(futures):
+                node = futures[future]
+                try:
+                    response_time = future.result()
+                    if response_time < float('inf'):
+                        working_nodes[node] = response_time
+                except Exception as e:
+                    print(f"  ❌ {node}: Test failed - {e}")
+
+        if working_nodes:
+            # Select fastest working node
+            selected_node = min(working_nodes.keys(), key=lambda x: working_nodes[x])
+            print(f"✅ Selected working RPC node: {selected_node} ({working_nodes[selected_node]:.3f}s)")
+            if hasattr(self, 'logger'):
+                self.logger.info(f"✅ Selected working RPC node: {selected_node}")
+            return selected_node
+        else:
+            print(f"⚠️  No working RPC nodes found, using fallback: {AKASH_NODE_FALLBACK}")
+            if hasattr(self, 'logger'):
+                self.logger.warning(f"⚠️  No working RPC nodes found, using fallback: {AKASH_NODE_FALLBACK}")
+            return AKASH_NODE_FALLBACK
+
+    def run_command(self, cmd, timeout=30, env=None):
+        if self.debug_mode:
+            # Never log commands that might contain sensitive data
+            cmd_str = ' '.join(cmd)
+            if any(sensitive in cmd_str.lower() for sensitive in ['mnemonic', 'password', 'key', 'seed']):
+                self.logger.debug("🔧 Executing: [SENSITIVE COMMAND HIDDEN]")
+            else:
+                self.logger.debug(f"🔧 Executing: {cmd_str}")
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env or os.environ)
+            return result.stdout, result.stderr, result.returncode
+        except subprocess.TimeoutExpired:
+            return "", "Command timed out", -1
+        except Exception as e:
+            return "", str(e), -1
+
+    def build_akash_command(self, args, needs_gas=False, use_mtls=False, extra_flags=None, needs_keyring=True):
+        """Build provider-services command"""
+        cmd = ['provider-services'] + args
+        
+        # Add RPC node for all commands that need blockchain connection
+        if any(x in args for x in ['query', 'tx']) or needs_gas:
+            cmd.extend(['--node', self.akash_node])
+            
+        if needs_keyring:
+            cmd.extend(['--keyring-backend', AKASH_KEYRING_BACKEND])
+        if needs_gas or ('lease-status' in args):
+            cmd.extend(['--from', AKASH_WALLET_NAME])
+        if needs_gas:
+            cmd.extend(['--chain-id', AKASH_CHAIN_ID, '--gas', 'auto', '--gas-adjustment', '1.75', '--gas-prices', '0.025uakt', '--yes'])
+        if use_mtls:
+            cmd.extend(['--auth-type', 'mtls'])
+        if extra_flags:
+            for k, v in extra_flags.items():
+                cmd.extend([f'--{k}', v])
+        return cmd
+
+    def execute_tx(self, tx_args, **kwargs):
+        """Execute transaction"""
+        cmd = self.build_akash_command(tx_args, needs_gas=True, **kwargs)
+        stdout, stderr, returncode = self.run_command(cmd, timeout=120)
+        return returncode == 0, stdout, stderr
+
+    def execute_query(self, query_args, **kwargs):
+        """Execute query with automatic RPC failover"""
+        needs_keyring = any(x in query_args for x in ['keys', 'lease-status', 'lease-shell'])
+        
+        # Try current node first
+        cmd = self.build_akash_command(query_args, needs_keyring=needs_keyring, **kwargs)
+        stdout, stderr, returncode = self.run_command(cmd, timeout=30)
+        
+        # If query failed and it was a blockchain query, try failover
+        if returncode != 0 and any(x in query_args for x in ['query', 'tx']):
+            self.logger.warning(f"⚠️  Query failed on {self.akash_node}, trying failover nodes...")
+            
+            # Try other nodes
+            for backup_node in AKASH_RPC_NODES:
+                if backup_node != self.akash_node:
+                    self.logger.info(f"🔄 Trying backup node: {backup_node}")
+                    
+                    # Temporarily switch node for this query
+                    original_node = self.akash_node
+                    self.akash_node = backup_node
+                    
+                    cmd = self.build_akash_command(query_args, needs_keyring=needs_keyring, **kwargs)
+                    stdout, stderr, returncode = self.run_command(cmd, timeout=30)
+                    
+                    if returncode == 0:
+                        self.logger.info(f"✅ Query succeeded on backup node: {backup_node}")
+                        # Update our primary node to the working one
+                        break
+                    else:
+                        # Restore original node for next attempt
+                        self.akash_node = original_node
+        
+        if returncode == 0:
+            try:
+                # Try JSON first
+                return True, json.loads(stdout)
+            except json.JSONDecodeError:
+                try:
+                    # Try YAML if JSON fails
+                    return True, yaml.safe_load(stdout)
+                except yaml.YAMLError:
+                    # Return raw string if both fail
+                    return True, stdout
+        return False, stderr
+
+    def restore_wallet(self):
+        """Restore wallet from backup"""
+        self.logger.info("🔐 Restoring wallet from backup...")
+        
+        # Check if wallet exists
+        success, result = self.execute_query(['keys', 'list', '--output', 'json'])
+        if success and isinstance(result, list):
+            for key in result:
+                if key.get('name') == AKASH_WALLET_NAME:
+                    self.wallet_address, self.balance_uakt = key.get('address'), self.get_wallet_balance()
+                    self.logger.info("✅ Wallet already exists")
+                    return True
+
+        # Try restoration
+        try:
+            storj_bucket = os.getenv('IWB_STORJ_WPOPS_BUCKET')
+            domain = os.getenv('IWB_DOMAIN')
+            if not all([storj_bucket, domain]):
+                self.logger.error("❌ Missing Storj environment variables")
+                return False
+
+            # Download and extract backup
+            backup_filename = f"{domain}_akash_latest.tar.gz"
+            storj_path = f"sj://{storj_bucket}/IWBDPP/akash/latest/{backup_filename}"
+            temp_dir = "/tmp/iwb-akash-restore"
+            os.makedirs(temp_dir, exist_ok=True)
+
+            # Download
+            stdout, stderr, rc = self.run_command(['uplink', 'cp', storj_path, f"{temp_dir}/{backup_filename}"], 60)
+            if rc != 0:
+                return False
+
+            # Extract
+            stdout, stderr, rc = self.run_command(['tar', '-xzf', f"{temp_dir}/{backup_filename}", '-C', temp_dir], 30)
+            if rc != 0:
+                return False
+
+            # Read wallet data
+            wallet_file = f"{temp_dir}/{compose_project}_akash-deploy-backup.json"
+            with open(wallet_file, 'r') as f:
+                wallet_data = json.load(f)
+
+            mnemonic = wallet_data.get('mnemonic')
+            if not mnemonic:
+                return False
+
+            # Restore wallet (securely - don't log mnemonic)
+            if self.debug_mode:
+                self.logger.debug("🔧 Executing: provider-services keys add [WALLET_NAME] --recover --keyring-backend test --interactive=false (mnemonic passed securely via stdin)")
+            
+            # Use subprocess.Popen to securely pass mnemonic via stdin without logging it
+            process = None
+            try:
+                process = subprocess.Popen(
+                    ['provider-services', 'keys', 'add', AKASH_WALLET_NAME, '--recover', '--keyring-backend', 'test', '--interactive=false'],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                stdout, stderr = process.communicate(input=mnemonic, timeout=30)
+                rc = process.returncode
+            except subprocess.TimeoutExpired:
+                if process:
+                    process.kill()
+                stdout, stderr, rc = "", "Wallet restoration timed out", -1
+            except Exception as e:
+                stdout, stderr, rc = "", f"Wallet restoration failed: {e}", -1
+
+            # Get wallet address from backup or query keyring
+            self.wallet_address = wallet_data.get('address')
+            if not self.wallet_address:
+                success, result = self.execute_query(['keys', 'show', AKASH_WALLET_NAME, '--output', 'json'])
+                if success and isinstance(result, dict):
+                    self.wallet_address = result.get('address')
+
+            # Cleanup
+            self.run_command(['rm', '-rf', temp_dir], 10)
+            return True
+
+        except Exception as e:
+            self.logger.error(f"❌ Wallet restoration failed: {e}")
+            return False
+
+    def cleanup_wallet(self):
+        """Clean up wallet from keyring for security"""
+        try:
+            self.logger.info("🧹 Cleaning up wallet from keyring for security...")
+            cmd = ['provider-services', 'keys', 'delete', AKASH_WALLET_NAME, '--keyring-backend', AKASH_KEYRING_BACKEND, '--yes']
+            stdout, stderr, returncode = self.run_command(cmd, timeout=10)
+            if returncode == 0:
+                self.logger.info("✅ Wallet cleaned from keyring")
+                return True
+            else:
+                self.logger.warning(f"⚠️  Wallet cleanup returned: {returncode} (may not have existed)")
+                return False
+        except Exception as e:
+            self.logger.error(f"❌ Wallet cleanup failed: {e}")
+            return False
+
+    def get_wallet_balance(self):
+        """Get wallet balance"""
+        if not self.wallet_address:
+            return 0
+        success, result = self.execute_query(['query', 'bank', 'balances', self.wallet_address])
+        
+        if self.debug_mode:
+            self.logger.debug(f"Balance query result: success={success}, result={result}")
+            
+        if success and isinstance(result, dict):
+            balances = result.get('balances', [])
+            if self.debug_mode:
+                self.logger.debug(f"Found {len(balances)} balance entries: {balances}")
+            for balance in balances:
+                if balance.get('denom') == 'uakt':
+                    amount = int(balance.get('amount', 0))
+                    self.balance_uakt = amount
+                    self.logger.info(f"💰 Balance: {amount / 1000000:.2f} AKT")
+                    return amount
+            # If no uakt balance found, wallet might be empty
+            self.logger.info(f"💰 Balance: 0.00 AKT (no uakt balance found)")
+        else:
+            self.logger.error(f"Failed to get balance: success={success}, result={result}")
+        return 0
+
+    def setup_certificate(self):
+        """Setup certificate"""
+        success, result = self.execute_query(['query', 'cert', 'list'])
+        if success and isinstance(result, dict) and result.get('certificates'):
+            self.logger.info("✅ Certificate already published")
+            return True
+        
+        success, _, _ = self.execute_tx(['tx', 'cert', 'publish', 'client'])
+        if success:
+            self.logger.info("✅ Certificate published")
+        return success
+
+    def create_deployment_manifest(self, api_credentials):
+        """Return path to manifest file - use provided file from n8n or yaml content directly"""
+        # If a YAML file was provided (e.g., from n8n at /tmp/deploy.yaml), use it directly
+        if self.yaml_file:
+            self.logger.info(f"📄 Using provided YAML file: {self.yaml_file}")
+            return self.yaml_file
+        
+        # If YAML content was provided as string, return it directly (provider-services can handle YAML content)
+        if self.yaml_content:
+            self.logger.info(f"📄 Using provided YAML content")
+            return self.yaml_content
+        
+        # Should not reach here in n8n workflow, but provide default if needed
+        self.logger.warning("⚠️  No YAML provided, this should not happen in n8n workflow")
+        return None
+
+    def generate_api_credentials(self, service_url=''):
+        """Generate API credentials"""
+        return {
+            'username': 'comfyui_' + ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6)),
+            'password': ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16)),
+            'api_url': service_url or 'http://service-url-placeholder'
+        }
+
+    def send_email(self, subject, body):
+        """Send email notification using system mail command"""
+        try:
+            mail_from = os.getenv('IWB_MAIL_USER', 'admin') + '@' + os.getenv('IWB_DOMAIN', 'localhost')
+            result = subprocess.run(['mail', '-s', subject, '-r', mail_from, mail_from], 
+                                  input=body, text=True, timeout=30, capture_output=True)
+            if result.returncode == 0:
+                self.logger.info("📧 Email sent successfully")
+                return True
+            self.logger.warning(f"⚠️ Email failed: {result.stderr}")
+            return False
+        except Exception as e:
+            self.logger.warning(f"⚠️ Email error: {e}")
+            return False
+
+    def get_akt_price(self):
+        """Get current AKT/USD price from CoinGecko, returns None if unavailable"""
+        try:
+            response = requests.get('https://api.coingecko.com/api/v3/simple/price?ids=akash-network&vs_currencies=usd', timeout=10)
+            if response.status_code == 200:
+                price = response.json().get('akash-network', {}).get('usd')
+                if price:
+                    self.logger.info(f"💱 AKT/USD: ${price:.2f}")
+                    return price
+        except Exception as e:
+            self.logger.warning(f"⚠️ Could not fetch AKT price: {e}")
+        return None
+
+    def save_state(self, deployment_info):
+        """Save deployment state"""
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump({'deployment_info': deployment_info, 'created_at': datetime.now(timezone.utc).isoformat() + 'Z', 'status': 'active'}, f, indent=2)
+            return True
+        except Exception:
+            return False
+
+    def load_state(self):
+        """Load deployment state"""
+        try:
+            return json.load(open(self.state_file)).get('deployment_info') if self.state_file.exists() else None
+        except Exception:
+            return None
+
+    def clear_state(self):
+        """Clear deployment state"""
+        try:
+            if self.state_file.exists(): self.state_file.unlink()
+            return True
+        except Exception:
+            return False
+
+    def has_active_deployment(self):
+        """Check for active deployment and validate it's still active"""
+        deployment_info = self.load_state()
+        if not deployment_info or not deployment_info.get('dseq'):
+            self.logger.debug("No active deployment state found")
+            return False, None
+        
+        dseq = deployment_info.get('dseq')
+        owner = deployment_info.get('owner', self.wallet_address)
+        
+        # Validate the deployment is still active by querying it
+        try:
+            success, result = self.execute_query(['query', 'deployment', 'get', '--dseq', str(dseq), '--owner', owner])
+            
+            if success and isinstance(result, dict):
+                # Debug the full structure
+                self.logger.debug(f"Deployment query result: {json.dumps(result, indent=2)}")
+                
+                # Try different possible structures
+                deployment_data = result.get('deployment', {})
+                if isinstance(deployment_data, dict):
+                    # Could be deployment.deployment or just deployment
+                    deployment = deployment_data.get('deployment', deployment_data)
+                    
+                    # Try to get deployment_id and state
+                    deployment_id = deployment.get('deployment_id', {})
+                    state = deployment.get('state', '').lower()
+                    
+                    self.logger.debug(f"Parsed deployment - DSEQ: {deployment_id.get('dseq')}, State: '{state}'")
+                    
+                    if state == 'active':
+                        self.logger.info(f"✅ Verified active deployment: DSEQ {dseq}")
+                        return True, deployment_info
+                    else:
+                        self.logger.info(f"🔄 Deployment {dseq} is no longer active (state: '{state}'), clearing state")
+                        self.clear_state()
+                        return False, None
+                else:
+                    self.logger.warning(f"🔄 Unexpected deployment data structure, clearing state")
+                    self.clear_state()
+                    return False, None
+            else:
+                self.logger.info(f"🔄 Could not verify deployment {dseq}, clearing state")
+                self.clear_state()
+                return False, None
+                
+        except Exception as e:
+            self.logger.warning(f"Error validating deployment {dseq}: {e}")
+            self.logger.info(f"🔄 Error validating deployment {dseq}, clearing state")
+            self.clear_state()
+            return False, None
+
+    def create_deployment(self):
+        """Create deployment"""
+        self.logger.info("📦 Creating deployment...")
+        manifest_path = self.create_deployment_manifest(self.generate_api_credentials())
+        success, stdout, stderr = self.execute_tx(['tx', 'deployment', 'create', manifest_path])
+        
+        if not success:
+            self.logger.error(f"❌ Deployment creation failed: {stderr}")
+            return {'success': False, 'error': f'Deployment creation failed: {stderr}'}
+
+        self.logger.debug(f"Deployment creation output: {stdout}")
+        
+        # Parse DSEQ from output - try multiple methods
+        dseq = None
+        
+        # Method 1: Try to parse as JSON first
+        try:
+            output_data = json.loads(stdout)
+            if isinstance(output_data, dict):
+                # Look for DSEQ in the transaction events
+                txhash = output_data.get('txhash')
+                if txhash:
+                    self.logger.info(f"Got transaction hash: {txhash}")
+                
+                # Try to extract DSEQ from transaction logs/events
+                logs = output_data.get('logs', [])
+                for log in logs:
+                    events = log.get('events', [])
+                    for event in events:
+                        if event.get('type') == 'akash.v1':
+                            attributes = event.get('attributes', [])
+                            for attr in attributes:
+                                if attr.get('key') == 'dseq':
+                                    dseq = attr.get('value')
+                                    if dseq:
+                                        break
+                        if dseq:
+                            break
+                    if dseq:
+                        break
+                
+                # If not found in logs, try the raw_log field
+                if not dseq:
+                    raw_log = output_data.get('raw_log', '')
+                    import re
+                    # Look for "dseq":"number" pattern in raw_log
+                    match = re.search(r'"dseq":"(\d+)"', raw_log)
+                    if match:
+                        dseq = match.group(1)
+                        
+        except (json.JSONDecodeError, Exception) as e:
+            self.logger.debug(f"JSON parsing failed: {e}")
+        
+        # Method 2: Parse text output
+        if not dseq:
+            for line in stdout.split('\n'):
+                line = line.strip()
+                # Look for patterns like "deployment created: 123456" or "dseq: 123456"
+                if any(keyword in line.lower() for keyword in ['deployment', 'created', 'dseq']):
+                    parts = line.split()
+                    for part in parts:
+                        # Check if it's a number (DSEQ is usually 6-8 digits)
+                        if part.isdigit() and len(part) >= 6:
+                            dseq = part
+                            break
+                if dseq:
+                    break
+        
+        # Method 3: Try to extract from any line with digits
+        if not dseq:
+            import re
+            for line in stdout.split('\n'):
+                # Look for sequences of 6+ digits
+                matches = re.findall(r'\b\d{6,}\b', line)
+                if matches:
+                    dseq = matches[0]  # Take the first long number we find
+                    break
+
+        if not dseq:
+            self.logger.error(f"Failed to parse DSEQ from output: {stdout}")
+            return {'success': False, 'error': f'Failed to parse deployment output. Raw output: {stdout}'}
+
+        self.logger.info(f"✅ Deployment created with DSEQ: {dseq}")
+        deployment_info = {'dseq': dseq, 'owner': self.wallet_address, 'manifest_path': manifest_path}
+        self.save_state(deployment_info)
+        return {'success': True, 'deployment_info': deployment_info}
+
+    def wait_for_bids(self, dseq, timeout=300):
+        """Wait for bids"""
+        self.logger.info(f"⏳ Waiting for bids for deployment {dseq}...")
+        
+        # First, check deployment status to make sure it's open for bidding
+        deploy_success, deploy_result = self.execute_query([
+            'query', 'deployment', 'get', '--dseq', dseq, '--owner', self.wallet_address
+        ])
+        
+        if deploy_success and isinstance(deploy_result, dict):
+            deployment = deploy_result.get('deployment', {})
+            state = deployment.get('state', 'unknown')
+            self.logger.info(f"🔍 Deployment state: {state}")
+            
+            if state != 'active':
+                self.logger.warning(f"⚠️  Deployment state is '{state}' - may not be accepting bids")
+        else:
+            self.logger.warning(f"⚠️  Could not check deployment status: {deploy_result}")
+        
+        start_time = time.time()
+        bid_check_count = 0
+        
+        while time.time() - start_time < timeout:
+            bid_check_count += 1
+            
+            # Use the correct bid query - the command syntax works, timeouts are RPC-node specific
+            success, result = self.execute_query([
+                'query', 'market', 'bid', 'list', 
+                '--dseq', dseq, '--owner', self.wallet_address, '--state', 'open'
+            ])
+            
+            self.logger.debug(f"Bid check #{bid_check_count}: success={success} (RPC: {self.akash_node})")
+            if self.debug_mode and bid_check_count <= 2:
+                self.logger.debug(f"Raw bid query result: {result}")
+            
+            if success and isinstance(result, dict):
+                bids = result.get('bids', [])
+                if bids:
+                    self.logger.info(f"✅ Received {len(bids)} open bids for DSEQ {dseq}")
+                    return bids
+                else:
+                    self.logger.debug(f"No open bids yet for DSEQ {dseq}")
+            elif success:
+                self.logger.debug(f"Bid query returned non-dict result: {type(result)} - {result}")
+            else:
+                self.logger.debug(f"Bid query failed on {self.akash_node}: {result}")
+                
+                # Try a different approach - query without state filter as fallback
+                if bid_check_count % 3 == 0:  # Every 3rd attempt, try different approach
+                    self.logger.debug(f"Trying bid query without state filter as fallback...")
+                    fallback_success, fallback_result = self.execute_query([
+                        'query', 'market', 'bid', 'list', '--dseq', dseq, '--owner', self.wallet_address
+                    ])
+                    
+                    if fallback_success and isinstance(fallback_result, dict):
+                        all_bids = fallback_result.get('bids', [])
+                        open_bids = [bid for bid in all_bids 
+                                   if bid.get('bid', {}).get('state') == 'open']
+                        if open_bids:
+                            self.logger.info(f"✅ Found {len(open_bids)} open bids via fallback query")
+                            return open_bids
+                        elif all_bids:
+                            closed_bids = [bid for bid in all_bids if bid.get('bid', {}).get('state') == 'closed']
+                            self.logger.debug(f"Found {len(all_bids)} total bids ({len(closed_bids)} closed) - no open bids")
+                    else:
+                        self.logger.debug(f"Fallback bid query also failed: {fallback_result}")
+            
+            if bid_check_count % 6 == 0:  # Every minute (6 * 10s = 60s)
+                elapsed = int(time.time() - start_time)
+                self.logger.info(f"Still waiting for bids... ({elapsed}s elapsed, {bid_check_count} checks)")
+            
+            time.sleep(10)
+        
+        self.logger.warning(f"❌ No bids received within {timeout}s timeout")
+        return None
+
+    def select_best_bid(self, bids):
+        """Select best bid using sophisticated scoring system"""
+        if not bids:
+            return None
+        
+        self.logger.info(f"🔍 Evaluating {len(bids)} bids using scoring system...")
+        
+        scored_bids = []
+        for bid in bids:
+            provider = bid['bid']['bid_id']['provider']
+            
+            # Get provider attributes
+            provider_attrs = self._get_provider_attributes(provider)
+            if not provider_attrs:
+                self.logger.warning(f"⚠️  Skipping bid from {provider[:20]}... - no attributes available")
+                continue
+            
+            # Score the provider
+            score = self._score_provider(provider, provider_attrs)
+            price = int(float(bid['bid']['price']['amount']))
+            
+            # Combined score (higher is better, but factor in price)
+            # Normalize price to score scale (lower price = higher score)
+            max_reasonable_price = 5000  # uakt per block
+            price_score = max(0, (max_reasonable_price - price) / max_reasonable_price * 100)
+            
+            # Weight: 70% provider quality, 30% price
+            combined_score = (score * 0.7) + (price_score * 0.3)
+            
+            # Get provider URL from provider data
+            provider_url = "N/A"
+            try:
+                success, provider_data = self.execute_query(['query', 'provider', 'get', provider, '--output', 'json'])
+                if success and isinstance(provider_data, dict):
+                    provider_url = provider_data.get('host_uri', 'N/A')
+            except Exception:
+                pass
+            
+            scored_bids.append({
+                'bid': bid,
+                'provider': provider,
+                'provider_url': provider_url,
+                'score': score,
+                'price': price,
+                'combined_score': combined_score,
+                'attributes': provider_attrs
+            })
+            
+            self.logger.info(f"  📊 {provider} - Score: {score:.1f}, Price: {price} uakt, Combined: {combined_score:.1f}")
+        
+        if not scored_bids:
+            self.logger.error("❌ No valid bids after scoring")
+            return None
+        
+        # Sort by combined score (highest first)
+        scored_bids.sort(key=lambda x: x['combined_score'], reverse=True)
+        
+        best = scored_bids[0]
+        self.logger.info(f"✅ Selected best bid: {best['provider']} (Score: {best['combined_score']:.1f})")
+        self.logger.info(f"📍 Provider URL: {best['provider_url']}")
+        
+        return best['bid']
+
+    def _get_provider_attributes(self, provider_address):
+        """Get provider attributes from Akash network"""
+        try:
+            success, result = self.execute_query(['query', 'provider', 'get', provider_address, '--output', 'json'])
+            if success and isinstance(result, dict):
+                # The result is now directly the provider data in JSON format
+                return result.get('attributes', [])
+            return None
+        except Exception as e:
+            self.logger.warning(f"⚠️  Failed to get provider attributes for {provider_address[:20]}...: {e}")
+            return None
+
+    def _score_provider(self, provider_address, attributes):
+        """Score provider based on attributes and GPU preferences"""
+        if not attributes:
+            return 0
+        
+        score = 0
+        attr_dict = {}
+        
+        # Convert attributes list to dict
+        for attr in attributes:
+            key = attr.get('key', '')
+            value = attr.get('value', '')
+            attr_dict[key] = value
+        
+        # Location scoring (US preference)
+        country = attr_dict.get('country', '').upper()
+        region = attr_dict.get('region', '').lower()
+        is_us_based = (country == 'US') or ('us-' in region)
+        
+        if is_us_based:
+            score += 50
+        elif country in ['CA', 'GB', 'DE', 'NL', 'AU']:
+            score += 30
+        
+        # GPU scoring based on manifest preferences
+        gpu_preferences = self._get_gpu_preferences_from_manifest()
+        gpu_model = attr_dict.get('capabilities/gpu/model', '').lower()
+        
+        if gpu_preferences and gpu_model:
+            for i, preferred_gpu in enumerate(gpu_preferences):
+                if preferred_gpu.lower() in gpu_model:
+                    # Higher score for higher priority GPUs
+                    score += 100 - (i * 10)
+                    break
+        elif attr_dict.get('capabilities/gpu/vendor') == 'nvidia':
+            score += 25  # Basic NVIDIA support
+        
+        # Organization quality
+        organization = attr_dict.get('organization', '').lower()
+        if 'overclock' in organization:
+            score += 20
+        elif 'datacenter' in attr_dict.get('location-type', '').lower():
+            score += 15
+        
+        return score
+
+    def _get_gpu_preferences_from_manifest(self):
+        """Extract GPU preferences from manifest"""
+        try:
+            manifest = None
+            if self.yaml_file:
+                with open(self.yaml_file, 'r') as f:
+                    manifest = yaml.safe_load(f.read())
+            elif self.yaml_content:
+                manifest = yaml.safe_load(self.yaml_content)
+            else:
+                # Default preferences if no manifest
+                return ['rtx4090', 'a100', 'h100', 'rtx3090', 'rtx3080']
+            
+            # Extract GPU preferences from profiles.compute.*.resources.gpu.attributes.vendor.nvidia
+            profiles = manifest.get('profiles', {})
+            compute = profiles.get('compute', {})
+            
+            gpu_preferences = []
+            for profile_name, profile_config in compute.items():
+                resources = profile_config.get('resources', {})
+                gpu = resources.get('gpu', {})
+                attributes = gpu.get('attributes', {})
+                vendor = attributes.get('vendor', {})
+                nvidia = vendor.get('nvidia', [])
+                
+                # Extract models in order of preference
+                for gpu_spec in nvidia:
+                    if isinstance(gpu_spec, dict) and 'model' in gpu_spec:
+                        model = gpu_spec['model'].lower()
+                        if model not in gpu_preferences:
+                            gpu_preferences.append(model)
+                
+                # If we found GPU preferences, use them
+                if gpu_preferences:
+                    self.logger.info(f"📋 GPU preferences from manifest: {gpu_preferences}")
+                    return gpu_preferences
+            
+            # Default GPU preference order if not specified in manifest
+            default_prefs = ['rtx4090', 'a100', 'h100', 'rtx3090', 'rtx3080', 'v100', 'a6000']
+            self.logger.info(f"📋 Using default GPU preferences: {default_prefs}")
+            return default_prefs
+            
+        except Exception as e:
+            self.logger.warning(f"⚠️  Could not extract GPU preferences: {e}")
+            default_prefs = ['rtx4090', 'a100', 'h100']
+            return default_prefs
+
+    def create_lease(self, dseq, bid):
+        """Create lease and save provider info"""
+        provider = bid['bid']['bid_id']['provider']
+        gseq = str(bid['bid']['bid_id']['gseq'])
+        oseq = str(bid['bid']['bid_id']['oseq'])
+        
+        self.logger.info(f"🤝 Creating lease with provider {provider}")
+        
+        success, stdout, stderr = self.execute_tx([
+            'tx', 'market', 'lease', 'create', 
+            '--dseq', str(dseq), '--gseq', gseq, '--oseq', oseq, '--provider', provider
+        ])
+        
+        if success:
+            lease_info = {
+                'provider': provider,
+                'dseq': dseq,
+                'gseq': gseq,
+                'oseq': oseq,
+                'status': 'active'
+            }
+            
+            # Update deployment state with provider info
+            deployment_state = self.load_state()
+            if deployment_state:
+                deployment_state.update(lease_info)
+                self.save_state(deployment_state)
+            
+            self.logger.info(f"✅ Lease created successfully")
+            return {'success': True, 'lease_info': lease_info}
+        else:
+            self.logger.error(f"❌ Lease creation failed: {stderr}")
+            return {'success': False, 'error': f'Lease creation failed: {stderr}'}
+
+    def send_manifest(self, manifest_file, dseq):
+        """Send manifest to provider"""
+        # Get provider info from saved state
+        deployment_state = self.load_state()
+        if not deployment_state or 'provider' not in deployment_state:
+            return {'success': False, 'error': 'No provider information found in deployment state'}
+        
+        provider = deployment_state['provider']
+        gseq = deployment_state.get('gseq', '1')
+        oseq = deployment_state.get('oseq', '1')
+        
+        self.logger.info(f"📤 Sending manifest to provider {provider[:20]}...")
+        
+        # Use send-manifest command directly (not a tx command, communicates directly with provider)
+        cmd = [
+            'provider-services', 'send-manifest', manifest_file,
+            '--dseq', str(dseq), '--gseq', gseq, '--oseq', oseq, '--provider', provider,
+            '--keyring-backend', AKASH_KEYRING_BACKEND, '--from', AKASH_WALLET_NAME,
+            '--node', self.akash_node, '--auth-type', 'mtls'
+        ]
+        
+        stdout, stderr, returncode = self.run_command(cmd, timeout=60)
+        success = returncode == 0
+        
+        if success:
+            self.logger.info(f"✅ Manifest sent successfully to provider")
+            return {'success': True, 'message': 'Manifest sent successfully'}
+        else:
+            self.logger.error(f"❌ Manifest send failed: {stderr}")
+            return {'success': False, 'error': f'Manifest send failed: {stderr}'}
+
+    def check_service_status(self, dseq):
+        """Check service status and readiness"""
+        # Get provider info from saved state
+        deployment_state = self.load_state()
+        if not deployment_state or 'provider' not in deployment_state:
+            return {'success': False, 'error': 'No provider information found in deployment state'}
+        
+        provider = deployment_state['provider']
+        gseq = deployment_state.get('gseq', '1')
+        oseq = deployment_state.get('oseq', '1')
+        
+        self.logger.info(f"🔍 Checking service status for deployment {dseq}")
+        
+        # Check lease status - use direct command, not query
+        cmd = [
+            'provider-services', 'lease-status',
+            '--dseq', str(dseq), '--gseq', gseq, '--oseq', oseq, '--provider', provider,
+            '--keyring-backend', AKASH_KEYRING_BACKEND, '--from', AKASH_WALLET_NAME,
+            '--node', self.akash_node, '--auth-type', 'mtls'
+        ]
+        
+        stdout, stderr, returncode = self.run_command(cmd, timeout=30)
+        success = returncode == 0
+        
+        if success:
+            try:
+                # Try JSON first, then YAML as fallback
+                try:
+                    status_data = json.loads(stdout) if stdout else {}
+                except json.JSONDecodeError:
+                    status_data = yaml.safe_load(stdout) if stdout else {}
+                
+                services = status_data.get('services', {})
+                
+                # Check if all services are running
+                all_ready = True
+                service_info = []
+                
+                for service_name, service_data in services.items():
+                    # Use ready_replicas and available_replicas from JSON output
+                    ready = service_data.get('ready_replicas', service_data.get('ready', 0))
+                    available = service_data.get('available_replicas', service_data.get('available', service_data.get('total', 0)))
+                    
+                    service_info.append({
+                        'name': service_name,
+                        'available': available,
+                        'ready': ready,
+                        'status': 'ready' if ready > 0 else 'starting'
+                    })
+                    
+                    if ready == 0:
+                        all_ready = False
+                
+                status = 'ready' if all_ready and service_info else 'starting'
+                
+                self.logger.info(f"Service status: {status}")
+                for svc in service_info:
+                    self.logger.info(f"  - {svc['name']}: {svc['ready']}/{svc['available']} ready")
+                
+                # Extract URIs from services
+                service_uris = {}
+                for service_name, service_data in services.items():
+                    uris = service_data.get('uris', [])
+                    if uris:
+                        service_uris[service_name] = uris
+                
+                return {
+                    'success': True, 
+                    'status': status,
+                    'services': service_info,
+                    'all_ready': all_ready,
+                    'service_uris': service_uris
+                }
+                
+            except Exception as e:
+                self.logger.warning(f"Failed to parse service status: {e}")
+                return {'success': True, 'status': 'unknown', 'raw_output': stdout}
+        else:
+            self.logger.error(f"❌ Service status check failed: {stderr}")
+            return {'success': False, 'error': f'Service status check failed: {stderr}'}
+
+    def check_models_downloaded(self, dseq):
+        """Check logs for model download completion indicator"""
+        logs_result = self.get_lease_logs(tail_lines=200)
+        
+        if logs_result.get('success') and logs_result.get('logs'):
+            logs = logs_result['logs']
+            # Look for the indicator that watchers have been established, meaning models are downloaded
+            if 'Watches established' in logs or 'watchers started' in logs.lower():
+                self.logger.info("✅ Models downloaded and watchers established")
+                return True
+            elif 'Downloads complete' in logs:
+                self.logger.info("⏳ Downloads complete, waiting for watchers...")
+                return False
+            else:
+                self.logger.debug("Still downloading models...")
+                return False
+        
+        return False
+
+    def wait_for_ready(self, dseq, provider, timeout=900):
+        """Wait for deployment ready"""
+        self.logger.info("⏳ Waiting for deployment to become ready...")
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            # Check service status using our enhanced method
+            status_result = self.check_service_status(dseq)
+            
+            if status_result['success']:
+                if status_result.get('all_ready', False):
+                    # Services are ready, check if models are downloaded
+                    if self.check_models_downloaded(dseq):
+                        self.logger.info("✅ Deployment is fully ready (services + models)!")
+                        
+                        # Get the service URL from URIs
+                        service_uris = status_result.get('service_uris', {})
+                        if service_uris:
+                            # Get the first service's first URI (usually comfyui)
+                            for service_name, uris in service_uris.items():
+                                if uris and len(uris) > 0:
+                                    # Construct full URL with https
+                                    service_url = f"https://{uris[0]}"
+                                    self.logger.info(f"🌐 Service URL: {service_url}")
+                                    return service_url
+                        
+                        self.logger.warning("⚠️ Services ready but no URIs found")
+                        return None
+                    else:
+                        self.logger.info("⏳ Services ready, waiting for model downloads...")
+                else:
+                    # Services are still starting
+                    self.logger.info(f"Services starting... ({status_result.get('status', 'unknown')})")
+            else:
+                self.logger.warning(f"Service status check failed: {status_result.get('error', 'Unknown error')}")
+            
+            time.sleep(30)
+        
+        self.logger.error(f"❌ Deployment failed to become ready within {timeout} seconds")
+        return None
+
+    def get_service_url_from_lease(self, dseq):
+        """Get service URL from lease status"""
+        status_result = self.check_service_status(dseq)
+        if status_result.get('success'):
+            service_uris = status_result.get('service_uris', {})
+            for service_name, uris in service_uris.items():
+                if uris and len(uris) > 0:
+                    return f"https://{uris[0]}"
+        return ""
+    
+    def get_active_deployment_info(self):
+        """Get active deployment info"""
+        deployment_info = self.load_state()
+        if deployment_info and deployment_info.get('dseq'):
+            return deployment_info['dseq'], deployment_info.get('provider', '')
+        
+        # Query for active deployments
+        if not self.wallet_address:
+            return None, None
+        
+        success, result = self.execute_query(['query', 'deployment', 'list'])
+        if success and isinstance(result, dict):
+            deployments = result.get('deployments', [])
+            for deployment in deployments:
+                if deployment.get('deployment', {}).get('deployment_id', {}).get('owner') == self.wallet_address:
+                    dseq = deployment.get('deployment', {}).get('deployment_id', {}).get('dseq')
+                    if dseq:
+                        return str(dseq), ""
+        return None, None
+
+    def run(self):
+        """Main deployment workflow"""
+        try:
+            # Check for existing active deployment
+            has_active, active_deployment_info = self.has_active_deployment()
+            if has_active and active_deployment_info:
+                # We have a verified active deployment
+                dseq = active_deployment_info.get('dseq')
+                self.logger.info(f"✅ Using existing active deployment: DSEQ {dseq}")
+                
+                # Get service URL if not already in state
+                service_url = active_deployment_info.get('service_url', '')
+                if not service_url:
+                    service_url = self.get_service_url_from_lease(dseq)
+                    if service_url:
+                        # Update state with service URL
+                        active_deployment_info['service_url'] = service_url
+                        self.save_state(active_deployment_info)
+                
+                # Get or generate API credentials if not already in state
+                api_credentials = active_deployment_info.get('api_credentials', {})
+                if not api_credentials:
+                    api_credentials = self.generate_api_credentials(service_url)
+                    # Update state with API credentials
+                    active_deployment_info['api_credentials'] = api_credentials
+                    self.save_state(active_deployment_info)
+                elif api_credentials.get('api_url') == 'http://service-url-placeholder' and service_url:
+                    # Update placeholder with actual URL
+                    api_credentials['api_url'] = service_url
+                    active_deployment_info['api_credentials'] = api_credentials
+                    self.save_state(active_deployment_info)
+                
+                return {
+                    'success': True,
+                    'deployment_info': active_deployment_info,
+                    'api_credentials': api_credentials,
+                    'service_url': service_url,
+                    'message': f"Using existing active deployment: DSEQ {dseq}"
+                }
+
+            if not self.restore_wallet():
+                return {'success': False, 'error': 'Wallet restoration failed'}
+
+            if self.get_wallet_balance() < 1000000:
+                return {'success': False, 'error': 'Insufficient balance'}
+
+            if not self.setup_certificate():
+                return {'success': False, 'error': 'Certificate setup failed'}
+
+            # Create deployment
+            result = self.create_deployment()
+            if not result['success']:
+                return result
+
+            dseq = result['deployment_info']['dseq']
+            
+            # Wait for bids
+            bids = self.wait_for_bids(dseq)
+            if not bids:
+                return {'success': False, 'error': 'No bids received'}
+
+            # Create lease
+            best_bid = self.select_best_bid(bids)
+            lease_result = self.create_lease(dseq, best_bid)
+            if not lease_result['success']:
+                return lease_result
+
+            provider = lease_result['lease_info']['provider']
+            
+            # Send manifest and wait
+            manifest_path = result['deployment_info'].get('manifest_path')
+            if not manifest_path:
+                return {'success': False, 'error': 'Manifest path not found in deployment info'}
+            
+            manifest_result = self.send_manifest(manifest_path, dseq)
+            if not manifest_result['success']:
+                return {'success': False, 'error': f"Manifest send failed: {manifest_result.get('error', 'Unknown error')}"}
+
+            service_url = self.wait_for_ready(dseq, provider)
+            if not service_url:
+                return {'success': False, 'error': 'Service failed to become ready'}
+
+            # Generate final API credentials with service URL
+            api_credentials = self.generate_api_credentials(service_url)
+            
+            # Update deployment state with final info
+            final_deployment_state = self.load_state()
+            if final_deployment_state:
+                final_deployment_state.update({
+                    'service_url': service_url,
+                    'api_credentials': api_credentials,
+                    'status': 'ready'
+                })
+                self.save_state(final_deployment_state)
+
+            # Send success notification email
+            try:
+                subject = f"Akash Deployment {dseq} Created Successfully"
+                body = f"""ComfyUI Deployment Created
+
+DSEQ: {dseq}
+Provider: {provider}
+Service URL: {service_url}
+Time: {datetime.now(timezone.utc).isoformat()}Z
+
+API Credentials:
+- Username: {api_credentials['username']}
+- Password: {api_credentials['password']}
+
+The deployment is ready to use.
+"""
+                self.send_email(subject, body)
+            except Exception as e:
+                self.logger.warning(f"⚠️ Could not send deployment notification: {e}")
+
+            return {
+                'success': True,
+                'message': 'ComfyUI deployment successful',
+                'deployment_info': result['deployment_info'],
+                'lease_info': lease_result['lease_info'],
+                'service_url': service_url,
+                'api_credentials': api_credentials
+            }
+
+        except Exception as e:
+            self.logger.error(f"❌ Deployment failed: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def close_deployment(self, dseq=None):
+        """Close deployment"""
+        try:
+            if not dseq:
+                dseq, _ = self.get_active_deployment_info()
+                if not dseq:
+                    return {'success': False, 'error': 'No active deployment found'}
+
+            self.logger.info(f"🛑 Closing deployment {dseq}...")
+            
+            # Close the deployment first
+            success, stdout, _ = self.execute_tx(['tx', 'deployment', 'close', '--dseq', dseq])
+            
+            if success:
+                self.clear_state()
+                
+                # Extract transaction fee from close transaction
+                tx_fee_akt = 0.0
+                lease_cost_akt = 0.0
+                
+                try:
+                    tx_data = json.loads(stdout)
+                    fee_info = tx_data.get('tx', {}).get('auth_info', {}).get('fee', {})
+                    for amount in fee_info.get('amount', []):
+                        if amount.get('denom') == 'uakt':
+                            tx_fee_akt = float(amount['amount']) / 1000000
+                            break
+                except (json.JSONDecodeError, KeyError):
+                    pass
+                
+                # Wait for blockchain confirmation then query actual lease cost
+                self.logger.info("� Waiting for blockchain confirmation...")
+                time.sleep(3)
+                
+                self.logger.info("🔍 Querying lease for actual cost...")
+                try:
+                    success_query, result = self.execute_query([
+                        'query', 'market', 'lease', 'list', '--owner', self.wallet_address, '--dseq', dseq
+                    ])
+                    if success_query and isinstance(result, dict):
+                        leases = result.get('leases', [])
+                        if leases:
+                            escrow = leases[0].get('escrow_payment', {})
+                            withdrawn = escrow.get('withdrawn', {})
+                            if isinstance(withdrawn, dict):
+                                withdrawn_uakt = float(withdrawn.get('amount', 0))
+                            else:
+                                withdrawn_uakt = float(withdrawn) if withdrawn else 0
+                            lease_cost_akt = withdrawn_uakt / 1000000
+                            self.logger.info(f"💰 Lease cost: {lease_cost_akt:.6f} AKT")
+                        else:
+                            self.logger.warning("⚠️ No lease information found")
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Could not query lease cost: {e}")
+                
+                # Calculate total cost
+                total_cost_akt = lease_cost_akt + tx_fee_akt
+                
+                # Get AKT price for USD conversion
+                akt_price = self.get_akt_price()
+                if akt_price:
+                    lease_cost_usd = lease_cost_akt * akt_price
+                    tx_fee_usd = tx_fee_akt * akt_price
+                    total_cost_usd = total_cost_akt * akt_price
+                    usd_info = f"""- Lease Cost: ${lease_cost_usd:.2f} USD
+- Transaction Fee: ${tx_fee_usd:.2f} USD
+- Total Cost: ${total_cost_usd:.2f} USD
+- AKT/USD Rate: ${akt_price:.2f}"""
+                else:
+                    usd_info = "- USD conversion: Not available (API unavailable)"
+                
+                # Send closure notification
+                try:
+                    subject = f"Akash Deployment {dseq} Closed - Cost Report"
+                    body = f"""Deployment Closure Report
+
+DSEQ: {dseq}
+Closed: {datetime.now(timezone.utc).isoformat()}Z
+
+Cost Analysis:
+- Lease Cost: {lease_cost_akt:.6f} AKT
+- Transaction Fee: {tx_fee_akt:.6f} AKT
+- Total Cost: {total_cost_akt:.6f} AKT
+
+{usd_info}
+
+Deployment closed and wallet cleaned up.
+"""
+                    self.send_email(subject, body)
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Could not send closure notification: {e}")
+                
+                return {'success': True, 'message': f'Deployment {dseq} closed', 'dseq': dseq}
+            return {'success': False, 'error': 'Deployment closure failed'}
+        
+        finally:
+            # Always clean up wallet after closing deployment for security
+            self.cleanup_wallet()
+
+    def get_lease_status(self):
+        """Get lease status"""
+        dseq, provider = self.get_active_deployment_info()
+        if not dseq:
+            return {'success': False, 'error': 'No active deployment found'}
+        if not provider:
+            return {'success': False, 'error': 'Provider not found'}
+
+        # Use check_service_status which properly calls lease-status
+        status_result = self.check_service_status(dseq)
+        return {
+            'success': status_result.get('success', False),
+            'dseq': dseq,
+            'provider': provider,
+            'status': status_result.get('status'),
+            'services': status_result.get('services', []),
+            'all_ready': status_result.get('all_ready', False)
+        }
+
+    def get_lease_logs(self, follow=False, tail_lines=100):
+        """Get lease logs"""
+        dseq, provider = self.get_active_deployment_info()
+        if not dseq or not provider:
+            return {'success': False, 'error': 'No active deployment found'}
+
+        # Get gseq and oseq from state
+        deployment_state = self.load_state()
+        if not deployment_state:
+            return {'success': False, 'error': 'No deployment state found'}
+        gseq = deployment_state.get('gseq', '1')
+        oseq = deployment_state.get('oseq', '1')
+
+        cmd = [
+            'provider-services', 'lease-logs',
+            '--dseq', str(dseq), '--gseq', gseq, '--oseq', oseq,
+            '--provider', provider,
+            '--keyring-backend', AKASH_KEYRING_BACKEND, '--from', AKASH_WALLET_NAME,
+            '--node', self.akash_node, '--auth-type', 'mtls'
+        ]
+        
+        if follow:
+            cmd.append('-f')
+        else:
+            cmd.extend(['--tail', str(tail_lines)])
+
+        stdout, stderr, rc = self.run_command(cmd, timeout=30)
+        return {'success': rc == 0, 'dseq': dseq, 'provider': provider, 'logs': stdout if rc == 0 else stderr}
+
+    def get_interactive_shell(self, service_name='comfyui'):
+        """Get interactive shell into the container"""
+        deployment_state = self.load_state()
+        if not deployment_state:
+            return {'success': False, 'error': 'No active deployment found'}
+
+        dseq = deployment_state.get('dseq')
+        provider = deployment_state.get('provider')
+        gseq = deployment_state.get('gseq', '1')
+        oseq = deployment_state.get('oseq', '1')
+
+        if not dseq or not provider:
+            return {'success': False, 'error': 'Missing deployment info'}
+
+        self.logger.info(f"🐚 Opening interactive shell for deployment {dseq}")
+        self.logger.info(f"   Service: {service_name}")
+        self.logger.info(f"   Provider: {provider}")
+        self.logger.info(f"   Type 'exit' to close the shell\n")
+        
+        # Use os.execvp to replace the current process with the shell command
+        # This provides a true interactive experience
+        cmd = [
+            'provider-services', 'lease-shell',
+            '--dseq', str(dseq), '--gseq', gseq, '--oseq', oseq, '--provider', provider,
+            '--keyring-backend', AKASH_KEYRING_BACKEND, '--from', AKASH_WALLET_NAME,
+            '--node', self.akash_node, '--auth-type', 'mtls',
+            '--tty', '--stdin',
+            service_name, '/bin/bash'
+        ]
+        
+        try:
+            # Execute the command directly (replaces current process)
+            import os
+            os.execvp(cmd[0], cmd)
+        except Exception as e:
+            return {'success': False, 'error': f'Failed to open shell: {str(e)}'}
+
+    def dry_run(self):
+        """Validate configuration"""
+        self.logger.info("🧪 Dry run - validating configuration...")
+        
+        try:
+            if not self.restore_wallet():
+                return {
+                    'success': False,
+                    'message': 'Configuration validation failed',
+                    'validation_results': {'wallet': False, 'balance': False, 'certificate': False, 'rpc_node': False},
+                    'error': 'Wallet restoration failed'
+                }
+
+            checks = {
+                'wallet': True,
+                'balance': self.get_wallet_balance() > 1000000,
+                'certificate': self.execute_query(['query', 'cert', 'list'])[0],
+                'rpc_node': bool(self.akash_node)  # Just check that we have a valid RPC node
+            }
+
+            result = {
+                'success': all(checks.values()),
+                'message': 'Configuration validated successfully' if all(checks.values()) else 'Configuration issues found',
+                'validation_results': checks,
+                'cost_estimate': {'estimated_cost_akt': 0.5, 'current_balance_akt': self.balance_uakt / 1000000, 'sufficient_funds': checks['balance']}
+            }
+            
+            return result
+            
+        finally:
+            # Always clean up wallet after dry-run for security
+            self.cleanup_wallet()
+
+def main():
+    parser = argparse.ArgumentParser(description='Deploy ComfyUI to Akash Network')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--dry-run', action='store_true', help='Validate without deploying')
+    parser.add_argument('--close', action='store_true', help='Close active deployment')
+    parser.add_argument('--status', action='store_true', help='Check lease status')
+    parser.add_argument('--logs', action='store_true', help='View deployment logs')
+    parser.add_argument('--shell', action='store_true', help='Get interactive shell into container')
+    parser.add_argument('--rpc-info', action='store_true', help='Show RPC info')
+    parser.add_argument('-y', '--yaml', help='Custom YAML manifest')
+    parser.add_argument('-f', '--yaml-file', help='Path to YAML file')
+
+    args = parser.parse_args()
+
+    has_action = any([args.rpc_info, args.dry_run, args.close, args.status, args.logs, args.shell])
+    has_yaml = any([args.yaml, args.yaml_file])
+    
+    if not has_action and not has_yaml:
+        parser.print_help()
+        sys.exit(0)
+
+    deployer = AkashDeployer(debug_mode=args.debug, yaml_content=args.yaml, yaml_file=args.yaml_file)
+
+    try:
+        if args.rpc_info:
+            result = {'selected_node': deployer.akash_node, 'available_nodes': AKASH_RPC_NODES}
+        elif args.dry_run:
+            result = deployer.dry_run()
+        elif args.close:
+            result = deployer.close_deployment()
+        elif args.status:
+            result = deployer.get_lease_status()
+        elif args.logs:
+            result = deployer.get_lease_logs()
+        elif args.shell:
+            # Note: get_interactive_shell() uses os.execvp and won't return
+            result = deployer.get_interactive_shell()
+        else:
+            result = deployer.run()
+
+        print(json.dumps(result, indent=2))
+        sys.exit(0 if result.get('success', False) else 1)
+
+    except Exception as e:
+        error_result = {'success': False, 'error': str(e), 'traceback': traceback.format_exc()}
+        print(json.dumps(error_result, indent=2))
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
