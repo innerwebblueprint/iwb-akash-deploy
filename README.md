@@ -47,7 +47,7 @@ cat > /tmp/deploy.yaml << 'EOF'
 {{ $json.yaml }}
 EOF
 iwb-akash-deploy --yaml-file /tmp/deploy.yaml
-
+```
 
 ### Environment Variables
 
@@ -56,6 +56,7 @@ These are automatically supplied with IWBDPP
 - `COMPOSE_PROJECT_NAME`: Project identifier (e.g., `tdk`)
 - `IWB_STORJ_WPOPS_BUCKET`: Storj bucket name
 - `IWB_DOMAIN`: Domain name
+
 
 ### Command Line Options
 
@@ -74,4 +75,4 @@ options:
   -y YAML, --yaml YAML  Custom YAML manifest
   -f YAML_FILE, --yaml-file YAML_FILE
                         Path to YAML file
-
+```
