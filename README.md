@@ -39,8 +39,10 @@ The script expects a properly formated Akash SDL passed using the appropriate fl
 This script is designed to be called from within n8n using two nodes:
 
 A node to supply an Akash SDL
+
 An execute command node:
 
+```bash
 cat > /tmp/deploy.yaml << 'EOF'
 {{ $json.yaml }}
 EOF
