@@ -1,0 +1,54 @@
+version: "2.0"
+
+services:
+  comfyui:
+    image: iwbp/iwb-comfyui-akash:dev-nightly_0921.1
+    expose:
+      - port: 8188
+        as: 80
+        to:
+          - global: true
+    env:
+      - MODE=prod   # test or prod
+      - WATCHDOG_MODE=auto # manual or auto - manual just keeps the container open. 
+      - COMFYUI_ENABLE_API=true # Enable ComfyUI API
+      - COMFYUI_API_KEY=${COMFYUI_API_KEY} # API key for authentication
+      - COMFYUI_USERNAME=${COMFYUI_USERNAME} # Optional: basic auth username
+      - COMFYUI_PASSWORD=${COMFYUI_PASSWORD} # Optional: basic auth password
+      - RCLONE_R2_ACCESS_KEY_ID=
+      - RCLONE_R2_SECRET_ACCESS_KEY=
+      - RCLONE_R2_ENDPOINT=
+      - RCLONE_R2_BUCKET=
+      - RCLONE_R2_REGION=auto
+profiles:
+  compute:
+    comfyui:
+      resources:
+        cpu:
+          units: 8.0
+        memory:
+          size: 64Gi
+        storage:
+          - size: 150Gi
+        gpu:
+          units: 1
+          attributes:
+            vendor:
+              nvidia:
+                - model: rtx4090
+                - model: a100
+                - model: h100
+                - model: v100
+                - model: a6000
+  placement:
+    default:
+      pricing:
+        comfyui:
+          denom: uakt
+          amount: 3000
+
+deployment:
+  comfyui:
+    default:
+      profile: comfyui
+      count: 1

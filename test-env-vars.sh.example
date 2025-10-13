@@ -1,0 +1,28 @@
+#!/bin/bash
+# =======================================================
+# Example Environment Variables for IWB Akash Deploy
+# =======================================================
+#
+# INSTRUCTIONS:
+# 1. Copy this file: cp test-env-vars.sh.example test-env-vars.sh
+# 2. Edit test-env-vars.sh with your actual values
+# 3. Source before running: source test-env-vars.sh
+#
+
+# IWB Project identifier i.e. tdk
+export COMPOSE_PROJECT_NAME="your_project_name"
+
+# Storj bucket name for your project
+export IWB_STORJ_WPOPS_BUCKET="your_bucket_name"
+
+# Your domain name
+export IWB_DOMAIN="yourdomain.com"
+
+# Optional: Custom Akash RPC node (uncomment to use)
+# export AKASH_NODE="https://rpc.akashnet.net:443"
+
+# Optional: Custom gas settings (uncomment to use)
+# export AKASH_GAS="auto"
+# export AKASH_GAS_ADJUSTMENT="1.75"
+# export AKASH_GAS_PRICES="0.025uakt"
+

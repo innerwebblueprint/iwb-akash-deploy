@@ -1,0 +1,24 @@
+[project]
+name = "iwb-akash-deploy"
+version = "1.0.0"
+description = "Automaticlly Deploy ComfyUI instances to Akash Network."
+authors = [
+    {name = "IWB Team", email = "info@innerwebblueprint.com"}
+]
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+
+dependencies = [
+    "requests>=2.31.0",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/innerwebblueprint/iwb-akash-deploy"
+Repository = "https://github.com/innerwebblueprint/iwb-akash-deploy"
+Issues = "https://github.com/innerwebblueprint/iwb-akash-deploy/issues"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,169 @@
+# ============================================
+# IWB Akash Deploy - Git Ignore File
+# ============================================
+
+# ============================================
+# RUNTIME & STATE FILES (NEVER COMMIT)
+# ============================================
+
+# Deployment state files
+active-deployment.json
+deployment_state.json
+*-deployment.json
+*.state.json
+*.log
+*.log.*
+logs/
+
+# Environment variable files
+.env
+.env.local
+.env.*.local
+test-env-vars.sh
+*-env-vars.sh
+
+# Wallet files
+*.wallet
+*.keyring
+.akash/
+keyring-test/
+wallets/
+
+# ============================================
+# PYTHON ENVIRONMENT & BUILD FILES
+# ============================================
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+virtualenv/
+
+# Python compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# ============================================
+# IDE & EDITOR FILES
+# ============================================
+
+# VSCode
+#.vscode/
+#*.code-workspace
+
+
+# ============================================
+# TESTING & COVERAGE
+# ============================================
+
+# pytest
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+
+
+# ============================================
+# OS FILES
+# ============================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+.directory
+.Trash-*
+
+# ============================================
+# TEMPORARY & BACKUP FILES
+# ============================================
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+
+# Temporary directories
+tmp/
+temp/
+cache/
+.cache/
+
+# ============================================
+# PROJECT-SPECIFIC FILES
+# ============================================
+
+# User-specific test files (keep example files)
+test*.yml
+!test.yml.example
+
+# Personal notes and scratch files
+notes/
+notes.txt
+TODO.txt
+todo.md
+scratch.md
+personal-*.md
+
+# Local database files
+*.db
+*.sqlite
+*.sqlite3
+
+# ============================================
+# SECURITY & SENSITIVE DATA (NEVER COMMIT)
+# ============================================
+
+# Certificates and keys
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+
+# SSH keys
+id_rsa
+id_dsa
+*.pub
+
+# API keys and tokens
+secrets.json
+secrets.yml
+.secrets
