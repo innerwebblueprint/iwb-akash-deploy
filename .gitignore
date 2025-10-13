@@ -74,9 +74,9 @@ MANIFEST
 # IDE & EDITOR FILES
 # ============================================
 
-# VSCode
-#.vscode/
-#*.code-workspace
+# VSCode (personal settings)
+.vscode/
+*.code-workspace
 
 
 # ============================================
