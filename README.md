@@ -12,6 +12,7 @@ This script is for use inside the IWBDPP (InnerWebBlueprint Digital Pressence Pl
 The script orchestrates the complete deployment lifecycle for instances on the Akash decentralized cloud network. It handles wallet management, certificate management, deployment creation, bid selection, lease management, and service monitoring, outputting clean JSON for n8n workflow integration.
 
 The script expects a properly formated Akash SDL passed using the appropriate flag:
+
 -f, --file FILE       Path to Akash SDL YAML file
 -y YAML, --yaml YAML  Custom YAML manifest
 
@@ -33,37 +34,26 @@ The script expects a properly formated Akash SDL passed using the appropriate fl
 - Akash CLI tools (`provider-services`)
 - Akash wallet with sufficient AKT for deployments
 
-## Installation
-
-1. Clone the repository:
-```bash
-git clone https://github.com/innerwebblueprint/iwb-akash-deploy.git
-cd iwb-akash-deploy
-```
-
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
 ## Usage
 
-### Basic Usage
+This script is designed to be called from within n8n using two nodes:
 
-```bash
-# Source environment variables
-source test-env-vars.sh
+A node to supply an Akash SDL
+An execute command node:
 
-# Deploy with SDL file
-python3 iwb-akash-deploy.py -f test.yml
-```
+cat > /tmp/deploy.yaml << 'EOF'
+{{ $json.yaml }}
+EOF
+iwb-akash-deploy --yaml-file /tmp/deploy.yaml
+
 
 ### Environment Variables
 
 Required environment variables:
+These are automatically supplied with IWBDPP
 - `COMPOSE_PROJECT_NAME`: Project identifier (e.g., `tdk`)
-- `IWB_STORJ_WPOPS_BUCKET`: Storj bucket name (optional)
-- `IWB_DOMAIN`: Domain name (optional)
+- `IWB_STORJ_WPOPS_BUCKET`: Storj bucket name
+- `IWB_DOMAIN`: Domain name
 
 ### Command Line Options
 
