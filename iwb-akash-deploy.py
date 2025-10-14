@@ -40,6 +40,7 @@ class AkashDeployer:
     
     def __init__(self, debug_mode=False, dseq=None, yaml_content=None, yaml_file=None):
         self.debug_mode = debug_mode
+        self.is_dry_run = False  # Flag to track if we're in dry-run mode
         self.dseq = dseq
         self.yaml_content = yaml_content
         self.yaml_file = yaml_file
@@ -298,6 +299,9 @@ class AkashDeployer:
             if not mnemonic:
                 self.logger.error("❌ No mnemonic found in backup file")
                 return False
+            
+            # Store mnemonic for future backups (will be used by create_wallet_backup)
+            self.wallet_mnemonic = mnemonic
 
             # Restore wallet (securely - don't log mnemonic)
             self.logger.info("   Importing wallet into keyring...")
@@ -339,6 +343,22 @@ class AkashDeployer:
                 if success and isinstance(result, dict):
                     self.wallet_address = result.get('address')
 
+            # Restore certificate file from backup if it exists
+            home_dir = os.path.expanduser("~")
+            cert_dir = os.path.join(home_dir, ".akash")
+            os.makedirs(cert_dir, exist_ok=True)
+            
+            pem_backup = f"{temp_dir}/{self.wallet_address}.pem"
+            if os.path.exists(pem_backup):
+                pem_dest = os.path.join(cert_dir, f"{self.wallet_address}.pem")
+                if self.debug_mode:
+                    self.logger.debug(f"   Restoring certificate file: {pem_backup} -> {pem_dest}")
+                shutil.copy2(pem_backup, pem_dest)
+                self.logger.info("✅ Certificate file restored from backup")
+            else:
+                if self.debug_mode:
+                    self.logger.debug(f"   No certificate file found in backup at: {pem_backup}")
+
             self.logger.info(f"✅ Wallet restored successfully: {self.wallet_address}")
             
             # Cleanup
@@ -354,11 +374,24 @@ class AkashDeployer:
             return False
 
     def cleanup_wallet(self):
-        """Clean up wallet from keyring for security"""
+        """Clean up wallet from keyring and certificate files for security"""
         try:
             self.logger.info("🧹 Cleaning up wallet from keyring for security...")
             cmd = ['provider-services', 'keys', 'delete', AKASH_WALLET_NAME, '--keyring-backend', AKASH_KEYRING_BACKEND, '--yes']
             stdout, stderr, returncode = self.run_command(cmd, timeout=10)
+            
+            # Also remove certificate file
+            if self.wallet_address:
+                home_dir = os.path.expanduser("~")
+                cert_dir = os.path.join(home_dir, ".akash")
+                pem_file = os.path.join(cert_dir, f"{self.wallet_address}.pem")
+                
+                if os.path.exists(pem_file):
+                    os.remove(pem_file)
+                    if self.debug_mode:
+                        self.logger.debug(f"   Removed certificate file: {pem_file}")
+                    self.logger.info("✅ Certificate file removed")
+            
             if returncode == 0:
                 self.logger.info("✅ Wallet cleaned from keyring")
                 return True
@@ -367,6 +400,119 @@ class AkashDeployer:
                 return False
         except Exception as e:
             self.logger.error(f"❌ Wallet cleanup failed: {e}")
+            return False
+
+    def create_wallet_backup(self):
+        """Create unified backup (wallet + certificate) and upload to Storj"""
+        try:
+            if not self.wallet_address:
+                self.logger.error("Cannot create backup without wallet address")
+                return False
+            
+            self.logger.info("💾 Creating wallet backup (wallet + certificate)...")
+            
+            # Get configuration
+            storj_bucket = os.getenv('IWB_STORJ_WPOPS_BUCKET')
+            domain = os.getenv('IWB_DOMAIN')
+            
+            if not all([storj_bucket, domain]):
+                self.logger.error("❌ Missing Storj environment variables (IWB_STORJ_WPOPS_BUCKET, IWB_DOMAIN)")
+                return False
+            
+            # Create temporary backup directory
+            temp_dir = "/tmp/iwb-akash-backup"
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            try:
+                # 1. Get wallet mnemonic (if available from restoration)
+                if hasattr(self, 'wallet_mnemonic') and self.wallet_mnemonic:
+                    mnemonic = self.wallet_mnemonic
+                else:
+                    # Try to export mnemonic from keyring
+                    if self.debug_mode:
+                        self.logger.debug("   Exporting mnemonic from keyring...")
+                    success, result = self.execute_query(['keys', 'export', AKASH_WALLET_NAME, '--unsafe', '--unarmored-hex'])
+                    if success and isinstance(result, str):
+                        mnemonic = result.strip()
+                    else:
+                        self.logger.warning("⚠️  Could not export mnemonic for backup")
+                        mnemonic = None
+                
+                # 2. Create wallet backup JSON
+                backup_file = f"{temp_dir}/{compose_project}_akash-deploy-backup.json"
+                wallet_data = {
+                    "walletName": AKASH_WALLET_NAME,
+                    "address": self.wallet_address,
+                    "createdAt": datetime.now(timezone.utc).isoformat(),
+                    "network": "akash",
+                    "chainId": AKASH_CHAIN_ID
+                }
+                
+                if mnemonic:
+                    wallet_data["mnemonic"] = mnemonic
+                
+                with open(backup_file, 'w') as f:
+                    json.dump(wallet_data, f, indent=2)
+                
+                if self.debug_mode:
+                    self.logger.debug(f"   Created wallet backup JSON: {backup_file}")
+                
+                # 3. Copy certificate file if it exists
+                home_dir = os.path.expanduser("~")
+                cert_dir = os.path.join(home_dir, ".akash")
+                cert_filename = f"{self.wallet_address}.pem"
+                cert_source = os.path.join(cert_dir, cert_filename)
+                
+                if os.path.exists(cert_source):
+                    cert_dest = f"{temp_dir}/{cert_filename}"
+                    shutil.copy2(cert_source, cert_dest)
+                    if self.debug_mode:
+                        self.logger.debug(f"   Copied certificate: {cert_filename}")
+                else:
+                    self.logger.warning(f"⚠️  Certificate not found for backup: {cert_source}")
+                
+                # 4. Create tar.gz archive
+                archive_name = f"{domain}_akash_latest.tar.gz"
+                archive_path = f"/tmp/{archive_name}"
+                
+                if self.debug_mode:
+                    self.logger.debug(f"   Creating archive: {archive_path}")
+                
+                stdout, stderr, rc = self.run_command(['tar', '-czf', archive_path, '-C', temp_dir, '.'], 30)
+                if rc != 0:
+                    self.logger.error(f"❌ Failed to create backup archive: {stderr}")
+                    return False
+                
+                # 5. Upload to Storj
+                storj_path = f"sj://{storj_bucket}/IWBDPP/akash/latest/{archive_name}"
+                if self.debug_mode:
+                    self.logger.debug(f"   Uploading to: {storj_path}")
+                
+                stdout, stderr, rc = self.run_command(['uplink', 'cp', archive_path, storj_path], 60)
+                if rc != 0:
+                    self.logger.error(f"❌ Failed to upload backup to Storj: {stderr}")
+                    return False
+                
+                self.logger.info(f"✅ Wallet backup uploaded to Storj: {storj_path}")
+                
+                # 6. Cleanup temp files
+                if self.debug_mode:
+                    self.logger.debug("   Cleaning up temporary backup files...")
+                self.run_command(['rm', '-rf', temp_dir], 10)
+                self.run_command(['rm', '-f', archive_path], 10)
+                
+                return True
+                
+            except Exception as e:
+                # Cleanup on error
+                self.run_command(['rm', '-rf', temp_dir], 10)
+                self.run_command(['rm', '-f', f"/tmp/{domain}_akash_latest.tar.gz"], 10)
+                raise e
+                
+        except Exception as e:
+            self.logger.error(f"❌ Wallet backup creation failed: {e}")
+            if self.debug_mode:
+                self.logger.debug(f"   Exception details: {traceback.format_exc()}")
             return False
 
     def get_wallet_balance(self):
@@ -395,24 +541,80 @@ class AkashDeployer:
         return 0
 
     def setup_certificate(self):
-        """Setup certificate"""
+        """Setup certificate - ensure both on-chain and local certificate files exist"""
         self.logger.info("🔐 Checking certificate status...")
         
-        # Query certificates for this wallet only
+        # Check if local certificate file exists
+        home_dir = os.path.expanduser("~")
+        cert_dir = os.path.join(home_dir, ".akash")
+        pem_file = os.path.join(cert_dir, f"{self.wallet_address}.pem")
+        
+        local_cert_exists = os.path.exists(pem_file)
+        
+        if self.debug_mode:
+            self.logger.debug(f"   Certificate directory: {cert_dir}")
+            self.logger.debug(f"   PEM file exists: {local_cert_exists}")
+        
+        # Query certificates for this wallet on-chain
         success, result = self.execute_query(['query', 'cert', 'list', '--owner', self.wallet_address])
+        
+        # Check if certificate exists on-chain (result must be dict with certificates)
         if success and isinstance(result, dict) and result.get('certificates'):
             cert_count = len(result.get('certificates', []))
             self.logger.info(f"✅ Certificate already published ({cert_count} certificate(s) found for this wallet)")
+            
+            # If on-chain certificate exists but local file is missing, regenerate it
+            if not local_cert_exists:
+                # In dry-run mode, just report what would happen
+                if self.is_dry_run:
+                    self.logger.info("🧪 DRY-RUN: Would regenerate local certificate files during actual deployment")
+                    return True
+                
+                self.logger.info("   Local certificate files missing, regenerating...")
+                os.makedirs(cert_dir, exist_ok=True)
+                
+                # Generate local certificate files (this creates .pem and .crt files)
+                # Note: This won't publish a new cert since one already exists on-chain
+                success, stdout, stderr = self.execute_tx(['tx', 'cert', 'generate', 'client'])
+                if success:
+                    self.logger.info("✅ Local certificate files regenerated successfully")
+                    return True
+                else:
+                    self.logger.error(f"❌ Failed to regenerate local certificate files: {stderr}")
+                    return False
             return True
         
-        self.logger.info("   Publishing new certificate to blockchain...")
+        # No certificate on-chain - need to generate and publish
+        # In dry-run mode, skip actual generation/publishing
+        if self.is_dry_run:
+            self.logger.info("🧪 DRY-RUN: Would generate and publish new certificate during actual deployment")
+            self.logger.info("🧪 DRY-RUN: Certificate generation requires AKT for gas fees")
+            return False  # Return False to indicate certificate doesn't exist yet
+        
+        self.logger.info("   Generating and publishing new certificate to blockchain...")
+        os.makedirs(cert_dir, exist_ok=True)
+        
+        # First generate local certificate files
+        success, stdout, stderr = self.execute_tx(['tx', 'cert', 'generate', 'client'])
+        if not success:
+            self.logger.error(f"❌ Certificate generation failed: {stderr}")
+            return False
+        
+        # Then publish to blockchain (this costs AKT)
         success, stdout, stderr = self.execute_tx(['tx', 'cert', 'publish', 'client'])
-        if success:
-            self.logger.info("✅ Certificate published successfully")
-            return True
-        else:
+        if not success:
             self.logger.error(f"❌ Certificate publication failed: {stderr}")
             return False
+        
+        self.logger.info("✅ Certificate published successfully")
+        
+        # AFTER successful publish, create unified backup (wallet + certificate) and upload to Storj
+        # This ensures we only backup if the publish succeeded (which costs AKT)
+        if not self.create_wallet_backup():
+            self.logger.warning("⚠️  Failed to create wallet backup with new certificate")
+            # Don't fail the whole process if backup fails
+        
+        return True
 
     def create_deployment_manifest(self, api_credentials):
         """Return path to manifest file - use provided file from n8n or yaml content directly"""
@@ -1487,6 +1689,7 @@ Deployment closed and wallet cleaned up.
 
     def dry_run(self):
         """Validate configuration"""
+        self.is_dry_run = True  # Set dry-run flag
         self.logger.info("🧪 Dry run - validating configuration...")
         
         try:
@@ -1501,22 +1704,44 @@ Deployment closed and wallet cleaned up.
             # Check balance
             balance_sufficient = self.get_wallet_balance() > 1000000
             
-            # Check certificate with proper logging
+            # Check certificate (both on-chain and local file)
             self.logger.info("🔐 Checking certificate status...")
+            
+            # Check for local certificate file
+            home_dir = os.path.expanduser("~")
+            cert_dir = os.path.join(home_dir, ".akash")
+            pem_file = os.path.join(cert_dir, f"{self.wallet_address}.pem")
+            local_cert_exists = os.path.exists(pem_file)
+            
+            if local_cert_exists:
+                self.logger.info(f"✅ Local certificate file found: {self.wallet_address}.pem")
+            else:
+                self.logger.warning(f"⚠️  Local certificate file missing: {self.wallet_address}.pem")
+            
+            # Check for on-chain certificate
             cert_success, cert_result = self.execute_query(['query', 'cert', 'list', '--owner', self.wallet_address])
-            cert_exists = False
+            cert_on_chain = False
             if cert_success and isinstance(cert_result, dict) and cert_result.get('certificates'):
                 cert_count = len(cert_result.get('certificates', []))
-                self.logger.info(f"✅ Certificate check passed ({cert_count} certificate(s) found for this wallet)")
-                cert_exists = True
+                self.logger.info(f"✅ On-chain certificate found ({cert_count} certificate(s) published)")
+                cert_on_chain = True
             else:
-                self.logger.warning("⚠️  No certificates found for this wallet (will need to publish before deployment)")
-                cert_exists = False
+                self.logger.warning("⚠️  No on-chain certificate found (will need to publish before deployment)")
+                cert_on_chain = False
+            
+            # Certificate is ready if we have both local file AND on-chain cert
+            # OR if we have on-chain cert (can regenerate local file)
+            cert_ready = cert_on_chain  # Can always regenerate local file from on-chain cert
+            
+            if cert_on_chain and not local_cert_exists:
+                self.logger.info("ℹ️  Local certificate file will be regenerated from on-chain certificate during deployment")
 
             checks = {
                 'wallet': True,
                 'balance': balance_sufficient,
-                'certificate': cert_exists,
+                'certificate': cert_ready,
+                'certificate_on_chain': cert_on_chain,
+                'certificate_local': local_cert_exists,
                 'rpc_node': bool(self.akash_node)
             }
 

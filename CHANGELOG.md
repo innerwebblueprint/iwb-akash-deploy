@@ -4,8 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Certificate file management**: Fixed deployment creation failure when wallet restored from backup in container environment. Script now properly manages certificate file throughout its lifecycle:
+  - Restores `.pem` file from Storj backup during wallet restoration
+  - Checks for both on-chain certificate AND local certificate file (`~/.akash/[address].pem`)
+  - Regenerates local file if on-chain cert exists but local file is missing
+  - Creates unified backup (wallet JSON + `.pem` file) and uploads to Storj after new certificate creation
+  - Removes certificate file during wallet cleanup
+  - This prevents "could not open certificate PEM file" errors during deployment creation
+- **Corrected certificate file handling**: Removed references to non-existent `.crt` files (Akash only uses `.pem` files)
+
 ### Added
+- **Unified wallet backup**: New `create_wallet_backup()` method creates tar.gz archive with wallet mnemonic + certificate file and uploads to Storj, maintaining compatibility with existing backup format
+- **Enhanced dry-run certificate checking**: Dry-run mode now checks both local `.pem` file existence AND on-chain certificate status, reporting detailed information in logs and output without making any changes
+- **Version bump script**: New `bump-version.sh` helper script automates version bumping, CHANGELOG updates, git tagging, and GitHub release creation
+- **Development documentation**: Added VERSION-BUMP-SCRIPT.md with detailed usage guide
 - New WORKFLOW.md documenting simple git workflow (commit early and often)
+
+### Improved
+- **Backup timing**: Unified backup is now created AFTER successful certificate publish (not before), ensuring we only backup if the publish succeeds (which costs AKT gas fees)
 - Added test-env-vars.sh.example as template for environment variables
 - Added examples/ directory with Akash SDL deployment example
 

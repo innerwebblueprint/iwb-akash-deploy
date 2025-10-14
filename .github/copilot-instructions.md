@@ -41,9 +41,34 @@ provider-services lease-status --dseq 12645678 --gseq 1 --oseq 1 \
 ```
 
 
-## Recent Fixes (2025-10-11)
+## Recent Fixes
 
-### ✅ Fixed: service_url and api_credentials now properly returned to n8n
+### ✅ Fixed: Local certificate files now properly managed (2025-10-14)
+
+**Problem**: When wallet was restored from Storj backup in container environment, script would check if certificate exists on-chain and return success, but local certificate file (`~/.akash/[address].pem`) was not present. This caused deployment creation to fail with error:
+```
+Error: could not open certificate PEM file: open /home/n8n/.akash/akash1yxe22e52wdaqy6nl6dj2wa6xs0438d23kpzxgj.pem: no such file or directory
+```
+
+**Solution**: 
+1. **Certificate Restoration**: Enhanced `restore_wallet()` to restore `.pem` file from Storj backup to `~/.akash/[address].pem`
+2. **Certificate Check**: Enhanced `setup_certificate()` to check for both on-chain AND local certificate file
+3. **Regeneration**: Automatically regenerates local certificate file if on-chain cert exists but local file is missing
+4. **New Certificates**: For new certificates, runs `generate` before `publish` then creates unified backup AFTER successful publish
+5. **Unified Backup**: Added `create_wallet_backup()` to create tar.gz with wallet JSON + `.pem` file and upload to Storj
+6. **Cleanup**: Enhanced `cleanup_wallet()` to remove certificate file (`~/.akash/[address].pem`)
+7. **Dry-Run Support**: Certificate setup skips actual generation/publishing in dry-run mode and reports local/on-chain certificate status
+
+**Result**: Script now ensures local certificate file always exists:
+- Restores `.pem` file from Storj backup during wallet restoration
+- Checks `~/.akash/[address].pem` existence (both locally and on-chain)
+- Regenerates file if on-chain cert exists but local file is missing
+- Creates unified backup AFTER successful certificate publish (only if publish succeeds, since it costs AKT)
+- Properly handles both new certificate generation and restoration scenarios
+- Cleans up certificate file during wallet cleanup
+- Dry-run mode checks both local `.pem` file and on-chain certificate, reports status without making changes
+
+### ✅ Fixed: service_url and api_credentials now properly returned to n8n (2025-10-11)
 
 **Problem**: When script detected an existing deployment, it returned empty `service_url` and `api_credentials` fields, making n8n integration impossible.
 

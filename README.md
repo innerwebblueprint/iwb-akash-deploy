@@ -76,3 +76,38 @@ options:
   -f YAML_FILE, --yaml-file YAML_FILE
                         Path to YAML file
 ```
+
+## Development
+
+### Version Management
+
+Use the `bump-version.sh` script to bump the version, update CHANGELOG, and create a release:
+
+```bash
+# Bump patch version (1.0.0 -> 1.0.1)
+./bump-version.sh patch
+
+# Bump minor version (1.0.0 -> 1.1.0)
+./bump-version.sh minor
+
+# Bump major version (1.0.0 -> 2.0.0)
+./bump-version.sh major
+```
+
+The script will:
+1. Check for uncommitted changes (prompts to commit if found)
+2. Bump version in `iwb-akash-deploy.py`
+3. Update `CHANGELOG.md` (move [Unreleased] to new version)
+4. Create a git commit with version bump
+5. Create a git tag (e.g., `v1.0.1`)
+6. Push commit and tag to GitHub
+
+### Testing
+
+```bash
+# Dry-run to validate configuration
+source test-env-vars.sh && python3 iwb-akash-deploy.py --dry-run
+
+# Debug mode with actual deployment
+source test-env-vars.sh && python3 iwb-akash-deploy.py -f test.yml --debug
+```
