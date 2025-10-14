@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.0.1] - 2025-10-13
+
 ### Fixed
 - **Certificate file management**: Fixed deployment creation failure when wallet restored from backup in container environment. Script now properly manages certificate file throughout its lifecycle:
   - Restores `.pem` file from Storj backup during wallet restoration
