@@ -117,13 +117,17 @@ git commit -m "Bump version to ${NEW_VERSION}"
 echo -e "${BLUE}🏷️  Creating git tag v${NEW_VERSION}...${NC}"
 git tag -a "v${NEW_VERSION}" -m "Release version ${NEW_VERSION}"
 
+# Get current branch name
+CURRENT_BRANCH=$(git branch --show-current)
+echo -e "${BLUE}📌 Current branch: ${YELLOW}${CURRENT_BRANCH}${NC}"
+
 # Push to GitHub
 echo -e "${BLUE}⬆️  Pushing to GitHub...${NC}"
-git push origin main
+git push origin "${CURRENT_BRANCH}"
 git push origin "v${NEW_VERSION}"
 
 echo -e "\n${GREEN}✅ Version bump complete!${NC}"
 echo -e "${GREEN}   Version: ${NEW_VERSION}${NC}"
 echo -e "${GREEN}   Tag: v${NEW_VERSION}${NC}"
-echo -e "${GREEN}   Pushed to: origin/main${NC}"
+echo -e "${GREEN}   Pushed to: origin/${CURRENT_BRANCH}${NC}"
 echo -e "\n${BLUE}🎉 Release v${NEW_VERSION} is now live on GitHub!${NC}"
