@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.0] - 2025-10-15
+
 ### Added
 - **Async deployment mode**: Default behavior now returns immediately after manifest send (~2 minutes) instead of waiting for full deployment readiness (15-20 minutes)
   - New `--check-ready` command to poll deployment status
