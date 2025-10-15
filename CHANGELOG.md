@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Async deployment mode**: Default behavior now returns immediately after manifest send (~2 minutes) instead of waiting for full deployment readiness (15-20 minutes)
+  - New `--check-ready` command to poll deployment status
+  - Three-stage status tracking: `starting` → `starting_services` → `downloading_models` → `ready`
+  - Returns `ready: false` with status information for n8n workflow polling
+  - Perfect for n8n integration - no more workflow timeouts or memory errors
+- **Single log file per deployment**: All logs for a given DSEQ now consolidated into one file
+  - Initial logs go to temporary file: `iwb-akash-deploy_YYYYMMDD_HHMMSS_temp.log`
+  - Once DSEQ obtained, switches to: `iwb-akash-deploy_{DSEQ}.log`
+  - Automatic log copying and cleanup of temporary files
+  - If DSEQ provided at init, uses DSEQ log file immediately
+- Comprehensive documentation for async deployment and n8n integration
+  - `ASYNC-DEPLOYMENT-N8N-INTEGRATION.md` - Full implementation guide
+  - `ASYNC-QUICK-REFERENCE.md` - Quick reference for daily use
+  - `LOG-FILE-CONSOLIDATION-FIX.md` - Logging improvements details
+
+### Changed
+- **Breaking**: Default `run()` behavior now returns after manifest send without waiting for ready status
+  - Use `--check-ready` to poll for deployment readiness
+  - Enables non-blocking n8n workflows with full timing control
+- Log file naming now includes DSEQ for easy identification
+
+### Improved
+- **Code condensation**: Reduced from 2062 lines to 2000 lines (3% reduction) through:
+  - New `_error_response()` helper method eliminates repeated error dict structures
+  - New `_update_deployment_metadata()` consolidates service URL and API credentials updates
+  - New `_parse_dseq_from_output()` condenses DSEQ extraction logic with modern Python patterns
+  - Better code organization and maintainability
+  - See `CODE-CONDENSATION-SUMMARY.md` for details
+
+### Technical Details
+- Added `check_ready()` method to check services and model download status
+- Modified `run()` to return immediately with `status: 'starting'`
+- Enhanced state management with status progression tracking
+- Log file switching with automatic history preservation
+- All functionality preserved with improved efficiency
+
 ## [1.0.2] - 2025-10-15
 
 ### Fixed

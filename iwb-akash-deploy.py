@@ -41,20 +41,21 @@ class AkashDeployer:
     def __init__(self, debug_mode=False, dseq=None, yaml_content=None, yaml_file=None):
         self.debug_mode = debug_mode
         self.is_dry_run = False  # Flag to track if we're in dry-run mode
-        self.dseq = dseq
+        self.dseq = dseq  # Set dseq early so _setup_logging can use it
         self.yaml_content = yaml_content
         self.yaml_file = yaml_file
         self.wallet_address = None
         self.wallet_mnemonic = None
         self.balance_uakt = 0
         self.akash_node = None  # Will be set after logger initialization
-        self.logger = self._setup_logging()
+        self.logger = self._setup_logging()  # Will use self.dseq if provided
         self.state_file = self._get_state_file()
         # Now select RPC node with proper logging
         self.akash_node = self._select_fastest_rpc_node()
 
     def _setup_logging(self):
         log_file = self._get_log_file_path()
+        self.current_log_file = log_file
         level = logging.DEBUG if self.debug_mode else logging.INFO
         handlers: List[logging.Handler] = [logging.FileHandler(log_file, mode='a')]
         if self.debug_mode:
@@ -64,7 +65,7 @@ class AkashDeployer:
         logger.info("=" * 50)
         return logger
 
-    def _get_log_file_path(self):
+    def _get_log_file_path(self, dseq=None):
         """Get log file path - prefer user's home directory"""
         home = os.getenv('HOME')
         if home:
@@ -79,9 +80,71 @@ class AkashDeployer:
         else:
             base_dir = Path(".")
         
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        suffix = f"_{self.dseq}" if self.dseq else ""
-        return str(base_dir / f"iwb-akash-deploy_{timestamp}{suffix}.log")
+        # Use dseq if provided, otherwise use self.dseq, otherwise use timestamp
+        if dseq:
+            return str(base_dir / f"iwb-akash-deploy_{dseq}.log")
+        elif self.dseq:
+            return str(base_dir / f"iwb-akash-deploy_{self.dseq}.log")
+        else:
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            return str(base_dir / f"iwb-akash-deploy_{timestamp}_temp.log")
+
+    def _switch_to_dseq_log_file(self, dseq):
+        """Switch logging to a dseq-specific log file"""
+        if not dseq:
+            return
+        
+        # Update self.dseq if not already set
+        if not self.dseq:
+            self.dseq = dseq
+        
+        # Get new log file path
+        new_log_file = self._get_log_file_path(dseq=dseq)
+        
+        # Check if we're already using this log file
+        if self.current_log_file == new_log_file:
+            return
+        
+        old_log_file = self.current_log_file
+        
+        # Log the transition
+        self.logger.info(f"📝 Switching to DSEQ-specific log file: {new_log_file}")
+        
+        # Remove existing file handlers
+        logger = logging.getLogger(__name__)
+        for handler in logger.handlers[:]:
+            if isinstance(handler, logging.FileHandler):
+                handler.close()
+                logger.removeHandler(handler)
+        
+        # Copy existing logs to new file
+        try:
+            if os.path.exists(old_log_file):
+                with open(old_log_file, 'r') as old_f:
+                    with open(new_log_file, 'a') as new_f:
+                        new_f.write(old_f.read())
+        except Exception as e:
+            # If copy fails, at least log the error to stderr
+            print(f"Warning: Failed to copy logs from {old_log_file} to {new_log_file}: {e}", file=sys.stderr)
+        
+        # Add new file handler
+        new_handler = logging.FileHandler(new_log_file, mode='a')
+        new_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(new_handler)
+        
+        # Update current log file
+        self.current_log_file = new_log_file
+        
+        # Log the completion
+        self.logger.info(f"✅ Now logging to: {new_log_file}")
+        
+        # Clean up old temporary log file
+        try:
+            if old_log_file != new_log_file and '_temp.log' in old_log_file and os.path.exists(old_log_file):
+                os.remove(old_log_file)
+                self.logger.info(f"🗑️  Removed temporary log file: {old_log_file}")
+        except Exception as e:
+            self.logger.warning(f"⚠️  Failed to remove temporary log file {old_log_file}: {e}")
 
     def _get_state_file(self):
         """Get state file path - prefer user's home directory"""
@@ -97,6 +160,18 @@ class AkashDeployer:
         
         # Fallback to current directory
         return Path("./active-deployment.json")
+
+    def _error_response(self, error, deployment_info=None, lease_info=None, service_url=None, api_credentials=None):
+        """Create standardized error response dict"""
+        return {
+            'success': False,
+            'message': 'Deployment failed',
+            'error': error,
+            'deployment_info': deployment_info,
+            'lease_info': lease_info,
+            'service_url': service_url,
+            'api_credentials': api_credentials
+        }
 
     def _select_fastest_rpc_node(self):
         """Select fastest RPC node with proper logging"""
@@ -833,6 +908,47 @@ class AkashDeployer:
             self.logger.warning(f"Error querying blockchain for active deployments: {e}")
             return False, None
 
+    def _parse_dseq_from_output(self, stdout):
+        """Parse DSEQ from deployment creation output - tries JSON then text patterns"""
+        import re
+        dseq = None
+        
+        # Try JSON parsing first
+        try:
+            output_data = json.loads(stdout)
+            if isinstance(output_data, dict):
+                if output_data.get('txhash'):
+                    self.logger.info(f"Got transaction hash: {output_data['txhash']}")
+                
+                # Extract from transaction logs/events
+                for log in output_data.get('logs', []):
+                    for event in log.get('events', []):
+                        if event.get('type') == 'akash.v1':
+                            for attr in event.get('attributes', []):
+                                if attr.get('key') == 'dseq' and attr.get('value'):
+                                    return attr['value']
+                
+                # Try raw_log field
+                if raw_log := output_data.get('raw_log', ''):
+                    if match := re.search(r'"dseq":"(\d+)"', raw_log):
+                        return match.group(1)
+        except (json.JSONDecodeError, Exception) as e:
+            self.logger.debug(f"JSON parsing failed: {e}")
+        
+        # Fall back to text parsing - look for 6+ digit numbers in relevant lines
+        for line in stdout.split('\n'):
+            line = line.strip()
+            if any(kw in line.lower() for kw in ['deployment', 'created', 'dseq']):
+                if matches := re.findall(r'\b\d{6,}\b', line):
+                    return matches[0]
+        
+        # Last resort: any 6+ digit number
+        for line in stdout.split('\n'):
+            if matches := re.findall(r'\b\d{6,}\b', line):
+                return matches[0]
+        
+        return None
+
     def create_deployment(self):
         """Create deployment"""
         self.logger.info("📦 Creating deployment...")
@@ -845,72 +961,8 @@ class AkashDeployer:
 
         self.logger.debug(f"Deployment creation output: {stdout}")
         
-        # Parse DSEQ from output - try multiple methods
-        dseq = None
-        
-        # Method 1: Try to parse as JSON first
-        try:
-            output_data = json.loads(stdout)
-            if isinstance(output_data, dict):
-                # Look for DSEQ in the transaction events
-                txhash = output_data.get('txhash')
-                if txhash:
-                    self.logger.info(f"Got transaction hash: {txhash}")
-                
-                # Try to extract DSEQ from transaction logs/events
-                logs = output_data.get('logs', [])
-                for log in logs:
-                    events = log.get('events', [])
-                    for event in events:
-                        if event.get('type') == 'akash.v1':
-                            attributes = event.get('attributes', [])
-                            for attr in attributes:
-                                if attr.get('key') == 'dseq':
-                                    dseq = attr.get('value')
-                                    if dseq:
-                                        break
-                        if dseq:
-                            break
-                    if dseq:
-                        break
-                
-                # If not found in logs, try the raw_log field
-                if not dseq:
-                    raw_log = output_data.get('raw_log', '')
-                    import re
-                    # Look for "dseq":"number" pattern in raw_log
-                    match = re.search(r'"dseq":"(\d+)"', raw_log)
-                    if match:
-                        dseq = match.group(1)
-                        
-        except (json.JSONDecodeError, Exception) as e:
-            self.logger.debug(f"JSON parsing failed: {e}")
-        
-        # Method 2: Parse text output
-        if not dseq:
-            for line in stdout.split('\n'):
-                line = line.strip()
-                # Look for patterns like "deployment created: 123456" or "dseq: 123456"
-                if any(keyword in line.lower() for keyword in ['deployment', 'created', 'dseq']):
-                    parts = line.split()
-                    for part in parts:
-                        # Check if it's a number (DSEQ is usually 6-8 digits)
-                        if part.isdigit() and len(part) >= 6:
-                            dseq = part
-                            break
-                if dseq:
-                    break
-        
-        # Method 3: Try to extract from any line with digits
-        if not dseq:
-            import re
-            for line in stdout.split('\n'):
-                # Look for sequences of 6+ digits
-                matches = re.findall(r'\b\d{6,}\b', line)
-                if matches:
-                    dseq = matches[0]  # Take the first long number we find
-                    break
-
+        # Parse DSEQ from output
+        dseq = self._parse_dseq_from_output(stdout)
         if not dseq:
             self.logger.error(f"Failed to parse DSEQ from output: {stdout}")
             return {'success': False, 'error': f'Failed to parse deployment output. Raw output: {stdout}'}
@@ -1370,6 +1422,30 @@ class AkashDeployer:
         self.logger.error(f"❌ Deployment failed to become ready within {timeout} seconds")
         return None
 
+    def _update_deployment_metadata(self, deployment_info, dseq):
+        """Update deployment metadata (service_url and api_credentials) if missing"""
+        # Get service URL if not already in state
+        service_url = deployment_info.get('service_url', '')
+        if not service_url:
+            service_url = self.get_service_url_from_lease(dseq, deployment_info)
+            if service_url:
+                deployment_info['service_url'] = service_url
+                self.save_state(deployment_info)
+        
+        # Get or generate API credentials if not already in state
+        api_credentials = deployment_info.get('api_credentials', {})
+        if not api_credentials:
+            api_credentials = self.generate_api_credentials(service_url)
+            deployment_info['api_credentials'] = api_credentials
+            self.save_state(deployment_info)
+        elif api_credentials.get('api_url') == 'http://service-url-placeholder' and service_url:
+            # Update placeholder with actual URL
+            api_credentials['api_url'] = service_url
+            deployment_info['api_credentials'] = api_credentials
+            self.save_state(deployment_info)
+        
+        return service_url, api_credentials
+
     def get_service_url_from_lease(self, dseq, deployment_info=None):
         """Get service URL from lease status
         
@@ -1412,20 +1488,99 @@ class AkashDeployer:
                         return str(dseq), ""
         return None, None
 
+    def check_ready(self):
+        """Check if deployment is ready (services running + models downloaded)"""
+        try:
+            # Restore wallet to get access to deployment info
+            if not self.restore_wallet():
+                return {'success': False, 'error': 'Wallet restoration failed', 'ready': False}
+            
+            # Check for active deployment
+            has_active, deployment_info = self.has_active_deployment()
+            if not has_active or not deployment_info:
+                return {'success': False, 'error': 'No active deployment found', 'ready': False}
+            
+            dseq = deployment_info.get('dseq')
+            self.logger.info(f"🔍 Checking if deployment {dseq} is ready...")
+            
+            # Switch to dseq-specific log file
+            self._switch_to_dseq_log_file(dseq)
+            
+            # Check service status
+            status_result = self.check_service_status(dseq)
+            
+            if not status_result.get('success'):
+                return {
+                    'success': True,
+                    'ready': False,
+                    'status': 'error_checking_status',
+                    'error': 'Failed to check service status',
+                    'dseq': dseq
+                }
+            
+            all_ready = status_result.get('all_ready', False)
+            
+            # If services are not ready, return early
+            if not all_ready:
+                self.logger.info(f"⏳ Services still starting...")
+                return {
+                    'success': True,
+                    'ready': False,
+                    'dseq': dseq,
+                    'status': 'starting_services',
+                    'message': 'Services are still starting'
+                }
+            
+            # Services are ready, check models
+            self.logger.info(f"✅ Services are ready, checking model downloads...")
+            models_ready = self.check_models_downloaded(dseq)
+            
+            if not models_ready:
+                self.logger.info(f"⏳ Services ready, waiting for model downloads...")
+                return {
+                    'success': True,
+                    'ready': False,
+                    'dseq': dseq,
+                    'status': 'downloading_models',
+                    'message': 'Services are ready, models still downloading'
+                }
+            
+            # Everything is ready! Update metadata
+            self.logger.info(f"✅ Models downloaded, finalizing deployment...")
+            service_url, api_credentials = self._update_deployment_metadata(deployment_info, dseq)
+            
+            # Update state to 'ready'
+            deployment_info['status'] = 'ready'
+            self.save_state(deployment_info)
+            
+            self.logger.info(f"✅ Deployment {dseq} is fully ready!")
+            
+            return {
+                'success': True,
+                'ready': True,
+                'dseq': dseq,
+                'deployment_info': deployment_info,
+                'service_url': service_url,
+                'api_credentials': api_credentials,
+                'status': 'ready',
+                'message': 'Deployment is fully ready'
+            }
+        
+        except Exception as e:
+            self.logger.error(f"❌ Check ready failed: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'ready': False,
+                'traceback': traceback.format_exc()
+            }
+
     def run(self):
         """Main deployment workflow"""
         try:
             # IMPORTANT: Restore wallet FIRST so we have wallet_address for checking existing deployments
             if not self.restore_wallet():
-                return {
-                    'success': False,
-                    'message': 'Deployment failed',
-                    'error': 'Wallet restoration failed',
-                    'deployment_info': None,
-                    'lease_info': None,
-                    'service_url': None,
-                    'api_credentials': None
-                }
+                return self._error_response('Wallet restoration failed')
 
             # Now check for existing active deployment (wallet_address is set)
             has_active, active_deployment_info = self.has_active_deployment()
@@ -1434,28 +1589,11 @@ class AkashDeployer:
                 dseq = active_deployment_info.get('dseq')
                 self.logger.info(f"✅ Using existing active deployment: DSEQ {dseq}")
                 
-                # Get service URL if not already in state
-                service_url = active_deployment_info.get('service_url', '')
-                if not service_url:
-                    # Pass deployment_info so check_service_status has access to provider details
-                    service_url = self.get_service_url_from_lease(dseq, active_deployment_info)
-                    if service_url:
-                        # Update state with service URL
-                        active_deployment_info['service_url'] = service_url
-                        self.save_state(active_deployment_info)
+                # Switch to dseq-specific log file
+                self._switch_to_dseq_log_file(dseq)
                 
-                # Get or generate API credentials if not already in state
-                api_credentials = active_deployment_info.get('api_credentials', {})
-                if not api_credentials:
-                    api_credentials = self.generate_api_credentials(service_url)
-                    # Update state with API credentials
-                    active_deployment_info['api_credentials'] = api_credentials
-                    self.save_state(active_deployment_info)
-                elif api_credentials.get('api_url') == 'http://service-url-placeholder' and service_url:
-                    # Update placeholder with actual URL
-                    api_credentials['api_url'] = service_url
-                    active_deployment_info['api_credentials'] = api_credentials
-                    self.save_state(active_deployment_info)
+                # Update metadata (service_url and api_credentials)
+                service_url, api_credentials = self._update_deployment_metadata(active_deployment_info, dseq)
                 
                 return {
                     'success': True,
@@ -1467,26 +1605,10 @@ class AkashDeployer:
 
             # No existing deployment found, continue with checks for new deployment
             if self.get_wallet_balance() < 1000000:
-                return {
-                    'success': False,
-                    'message': 'Deployment failed',
-                    'error': 'Insufficient balance',
-                    'deployment_info': None,
-                    'lease_info': None,
-                    'service_url': None,
-                    'api_credentials': None
-                }
+                return self._error_response('Insufficient balance')
 
             if not self.setup_certificate():
-                return {
-                    'success': False,
-                    'message': 'Deployment failed',
-                    'error': 'Certificate setup failed',
-                    'deployment_info': None,
-                    'lease_info': None,
-                    'service_url': None,
-                    'api_credentials': None
-                }
+                return self._error_response('Certificate setup failed')
 
             # Create deployment
             result = self.create_deployment()
@@ -1495,18 +1617,13 @@ class AkashDeployer:
 
             dseq = result['deployment_info']['dseq']
             
+            # Switch to dseq-specific log file now that we have the dseq
+            self._switch_to_dseq_log_file(dseq)
+            
             # Wait for bids
             bids = self.wait_for_bids(dseq)
             if not bids:
-                return {
-                    'success': False,
-                    'message': 'Deployment failed',
-                    'error': 'No bids received',
-                    'deployment_info': result.get('deployment_info'),
-                    'lease_info': None,
-                    'service_url': None,
-                    'api_credentials': None
-                }
+                return self._error_response('No bids received', deployment_info=result.get('deployment_info'))
 
             # Create lease
             best_bid = self.select_best_bid(bids)
@@ -1519,81 +1636,90 @@ class AkashDeployer:
             # Send manifest and wait
             manifest_path = result['deployment_info'].get('manifest_path')
             if not manifest_path:
-                return {
-                    'success': False,
-                    'message': 'Deployment failed',
-                    'error': 'Manifest path not found in deployment info',
-                    'deployment_info': result.get('deployment_info'),
-                    'lease_info': lease_result.get('lease_info'),
-                    'service_url': None,
-                    'api_credentials': None
-                }
+                return self._error_response('Manifest path not found in deployment info', 
+                                           deployment_info=result.get('deployment_info'),
+                                           lease_info=lease_result.get('lease_info'))
             
             manifest_result = self.send_manifest(manifest_path, dseq)
             if not manifest_result['success']:
-                return {
-                    'success': False,
-                    'message': 'Deployment failed',
-                    'error': f"Manifest send failed: {manifest_result.get('error', 'Unknown error')}",
-                    'deployment_info': result.get('deployment_info'),
-                    'lease_info': lease_result.get('lease_info'),
-                    'service_url': None,
-                    'api_credentials': None
-                }
+                return self._error_response(f"Manifest send failed: {manifest_result.get('error', 'Unknown error')}",
+                                           deployment_info=result.get('deployment_info'),
+                                           lease_info=lease_result.get('lease_info'))
 
-            service_url = self.wait_for_ready(dseq, provider)
-            if not service_url:
-                return {
-                    'success': False,
-                    'message': 'Deployment failed',
-                    'error': 'Service failed to become ready',
-                    'deployment_info': result.get('deployment_info'),
-                    'lease_info': lease_result.get('lease_info'),
-                    'service_url': None,
-                    'api_credentials': None
-                }
-
-            # Generate final API credentials with service URL
-            api_credentials = self.generate_api_credentials(service_url)
+            # NEW DEFAULT BEHAVIOR: Return immediately after manifest send
+            # The deployment will continue starting in the background
+            # Use --check-ready to poll for readiness
+            self.logger.info("✅ Deployment started successfully (manifest sent)")
+            self.logger.info("⏳ Services are starting in the background...")
+            self.logger.info("💡 Use --check-ready to check when deployment is fully ready")
             
-            # Update deployment state with final info
+            # Generate placeholder credentials (will be updated when ready)
+            api_credentials = self.generate_api_credentials()
+            
+            # Save to state with 'starting' status
             final_deployment_state = self.load_state()
             if final_deployment_state:
-                final_deployment_state.update({
-                    'service_url': service_url,
-                    'api_credentials': api_credentials,
-                    'status': 'ready'
-                })
+                final_deployment_state['api_credentials'] = api_credentials
+                final_deployment_state['status'] = 'starting'
                 self.save_state(final_deployment_state)
-
-            # Send success notification email
-            try:
-                subject = f"Akash Deployment {dseq} Created Successfully"
-                body = f"""ComfyUI Deployment Created
-
-DSEQ: {dseq}
-Provider: {provider}
-Service URL: {service_url}
-Time: {datetime.now(timezone.utc).isoformat()}Z
-
-API Credentials:
-- Username: {api_credentials['username']}
-- Password: {api_credentials['password']}
-
-The deployment is ready to use.
-"""
-                self.send_email(subject, body)
-            except Exception as e:
-                self.logger.warning(f"⚠️ Could not send deployment notification: {e}")
-
+            
             return {
                 'success': True,
-                'message': 'ComfyUI deployment successful',
+                'message': 'Deployment started successfully. Use --check-ready to verify when ready.',
                 'deployment_info': result['deployment_info'],
                 'lease_info': lease_result['lease_info'],
-                'service_url': service_url,
-                'api_credentials': api_credentials
+                'service_url': None,  # Not available yet
+                'api_credentials': api_credentials,
+                'ready': False,
+                'status': 'starting',
+                'dseq': dseq,
+                'provider': provider
             }
+
+            # OLD BEHAVIOR (commented out - now use --check-ready instead):
+            # service_url = self.wait_for_ready(dseq, provider)
+            # if not service_url:
+            #     return self._error_response('Service failed to become ready',
+            #                                deployment_info=result.get('deployment_info'),
+            #                                lease_info=lease_result.get('lease_info'))
+            #
+            # # Update deployment state with service URL, API credentials, and status
+            # final_deployment_state = self.load_state()
+            # if final_deployment_state:
+            #     service_url, api_credentials = self._update_deployment_metadata(final_deployment_state, dseq)
+            #     final_deployment_state['status'] = 'ready'
+            #     self.save_state(final_deployment_state)
+            # else:
+            #     api_credentials = self.generate_api_credentials(service_url)
+            #
+            # # Send success notification email
+            # try:
+            #     subject = f"Akash Deployment {dseq} Created Successfully"
+            #     body = f"""ComfyUI Deployment Created
+            #
+            # DSEQ: {dseq}
+            # Provider: {provider}
+            # Service URL: {service_url}
+            # Time: {datetime.now(timezone.utc).isoformat()}Z
+            #
+            # API Credentials:
+            # - Username: {api_credentials['username']}
+            # - Password: {api_credentials['password']}
+            #
+            # The deployment is ready to use.
+            # """
+            #     self.send_email(subject, body)
+            # except Exception as e:
+            #     self.logger.warning(f"⚠️ Could not send deployment notification: {e}")
+            #
+            # return {
+            #     'success': True,
+            #     'message': 'ComfyUI deployment successful',
+            #     'deployment_info': result['deployment_info'],
+            #     'lease_info': lease_result['lease_info'],
+            #     'service_url': service_url,
+            #     'api_credentials': api_credentials
+            # }
 
         except Exception as e:
             self.logger.error(f"❌ Deployment failed: {e}")
@@ -1914,6 +2040,7 @@ def main():
     parser = argparse.ArgumentParser(description='Deploy ComfyUI to Akash Network')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--dry-run', action='store_true', help='Validate without deploying')
+    parser.add_argument('--check-ready', action='store_true', help='Check if deployment is ready (services + models)')
     parser.add_argument('--close', action='store_true', help='Close active deployment')
     parser.add_argument('--status', action='store_true', help='Check lease status')
     parser.add_argument('--logs', action='store_true', help='View deployment logs')
@@ -1925,7 +2052,7 @@ def main():
     args = parser.parse_args()
 
     # Determine which actions don't require YAML
-    query_actions = [args.rpc_info, args.close, args.status, args.logs, args.shell]
+    query_actions = [args.rpc_info, args.check_ready, args.close, args.status, args.logs, args.shell]
     deployment_actions = [args.dry_run, (not any(query_actions))]  # dry-run or production deploy
     
     has_query_action = any(query_actions)
@@ -1957,6 +2084,9 @@ def main():
             result = {'selected_node': deployer.akash_node, 'available_nodes': AKASH_RPC_NODES}
         elif args.dry_run:
             result = deployer.dry_run()
+        elif args.check_ready:
+            # Check if deployment is ready (services + models)
+            result = deployer.check_ready()
         elif args.close or args.status or args.logs or args.shell:
             # These commands need wallet restored to access deployment info
             if not deployer.restore_wallet():
@@ -1975,7 +2105,7 @@ def main():
                 # Note: get_interactive_shell() uses os.execvp and won't return
                 result = deployer.get_interactive_shell()
         else:
-            # Production deployment
+            # Production deployment (returns immediately after manifest send)
             result = deployer.run()
         
         if result is None:
