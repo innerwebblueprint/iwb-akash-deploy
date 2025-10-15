@@ -65,12 +65,18 @@ class AkashDeployer:
         return logger
 
     def _get_log_file_path(self):
-        try:
-            log_dir = Path("/var/log/akash-deploy")
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_dir.chmod(stat.S_IRWXU | stat.S_IRWXG | stat.S_IROTH | stat.S_IXOTH)
-            base_dir = log_dir
-        except (PermissionError, OSError):
+        """Get log file path - prefer user's home directory"""
+        home = os.getenv('HOME')
+        if home:
+            try:
+                base_dir = Path(home)
+                # Test write access
+                test_file = base_dir / ".write_test"
+                test_file.touch()
+                test_file.unlink()
+            except (PermissionError, OSError):
+                base_dir = Path(".")
+        else:
             base_dir = Path(".")
         
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -78,12 +84,19 @@ class AkashDeployer:
         return str(base_dir / f"iwb-akash-deploy_{timestamp}{suffix}.log")
 
     def _get_state_file(self):
-        try:
-            primary = Path("/var/log/akash-deploy/active-deployment.json")
-            primary.parent.mkdir(parents=True, exist_ok=True)
-            return primary
-        except (PermissionError, OSError):
-            return Path("./active-deployment.json")
+        """Get state file path - prefer user's home directory"""
+        home = os.getenv('HOME')
+        if home:
+            try:
+                state_file = Path(home) / "active-deployment.json"
+                # Test write access
+                state_file.touch()
+                return state_file
+            except (PermissionError, OSError):
+                pass
+        
+        # Fallback to current directory
+        return Path("./active-deployment.json")
 
     def _select_fastest_rpc_node(self):
         """Select fastest RPC node with proper logging"""
@@ -671,10 +684,13 @@ class AkashDeployer:
     def save_state(self, deployment_info):
         """Save deployment state"""
         try:
+            self.logger.debug(f"💾 Saving state to: {self.state_file}")
             with open(self.state_file, 'w') as f:
                 json.dump({'deployment_info': deployment_info, 'created_at': datetime.now(timezone.utc).isoformat() + 'Z', 'status': 'active'}, f, indent=2)
+            self.logger.debug(f"✅ State saved successfully")
             return True
-        except Exception:
+        except Exception as e:
+            self.logger.warning(f"⚠️  Failed to save state to {self.state_file}: {e}")
             return False
 
     def load_state(self):
@@ -692,56 +708,129 @@ class AkashDeployer:
         except Exception:
             return False
 
-    def has_active_deployment(self):
-        """Check for active deployment and validate it's still active"""
-        deployment_info = self.load_state()
-        if not deployment_info or not deployment_info.get('dseq'):
-            self.logger.debug("No active deployment state found")
-            return False, None
-        
-        dseq = deployment_info.get('dseq')
-        owner = deployment_info.get('owner', self.wallet_address)
-        
-        # Validate the deployment is still active by querying it
+    def _get_lease_info_for_deployment(self, dseq):
+        """Query lease information for a deployment to get provider details"""
         try:
-            success, result = self.execute_query(['query', 'deployment', 'get', '--dseq', str(dseq), '--owner', owner])
+            success, result = self.execute_query(['query', 'market', 'lease', 'list', '--owner', self.wallet_address])
             
             if success and isinstance(result, dict):
-                # Debug the full structure
-                self.logger.debug(f"Deployment query result: {json.dumps(result, indent=2)}")
+                leases = result.get('leases', [])
                 
-                # Try different possible structures
-                deployment_data = result.get('deployment', {})
-                if isinstance(deployment_data, dict):
-                    # Could be deployment.deployment or just deployment
-                    deployment = deployment_data.get('deployment', deployment_data)
+                # Find lease for this deployment
+                for lease_entry in leases:
+                    lease = lease_entry.get('lease', {})
+                    lease_id = lease.get('lease_id', {})
                     
-                    # Try to get deployment_id and state
+                    if str(lease_id.get('dseq')) == str(dseq) and lease.get('state', '').lower() == 'active':
+                        # Found active lease for this deployment
+                        return {
+                            'provider': lease_id.get('provider', ''),
+                            'gseq': str(lease_id.get('gseq', '1')),
+                            'oseq': str(lease_id.get('oseq', '1'))
+                        }
+            
+            self.logger.debug(f"No active lease found for deployment {dseq}")
+            return None
+            
+        except Exception as e:
+            self.logger.warning(f"Error querying lease info for deployment {dseq}: {e}")
+            return None
+
+    def has_active_deployment(self):
+        """Check for active deployment and validate it's still active"""
+        # First check local state file
+        deployment_info = self.load_state()
+        if deployment_info and deployment_info.get('dseq'):
+            dseq = deployment_info.get('dseq')
+            owner = deployment_info.get('owner', self.wallet_address)
+            
+            # Validate the deployment is still active by querying it
+            try:
+                success, result = self.execute_query(['query', 'deployment', 'get', '--dseq', str(dseq), '--owner', owner])
+                
+                if success and isinstance(result, dict):
+                    # Debug the full structure
+                    self.logger.debug(f"Deployment query result: {json.dumps(result, indent=2)}")
+                    
+                    # Try different possible structures
+                    deployment_data = result.get('deployment', {})
+                    if isinstance(deployment_data, dict):
+                        # Could be deployment.deployment or just deployment
+                        deployment = deployment_data.get('deployment', deployment_data)
+                        
+                        # Try to get deployment_id and state
+                        deployment_id = deployment.get('deployment_id', {})
+                        state = deployment.get('state', '').lower()
+                        
+                        self.logger.debug(f"Parsed deployment - DSEQ: {deployment_id.get('dseq')}, State: '{state}'")
+                        
+                        if state == 'active':
+                            self.logger.info(f"✅ Verified active deployment from state file: DSEQ {dseq}")
+                            return True, deployment_info
+                        else:
+                            self.logger.info(f"🔄 Deployment {dseq} from state file is no longer active (state: '{state}'), clearing state")
+                            self.clear_state()
+                    else:
+                        self.logger.warning(f"🔄 Unexpected deployment data structure, clearing state")
+                        self.clear_state()
+                else:
+                    self.logger.info(f"🔄 Could not verify deployment {dseq} from state file, clearing state")
+                    self.clear_state()
+                    
+            except Exception as e:
+                self.logger.warning(f"Error validating deployment {dseq} from state file: {e}")
+                self.logger.info(f"🔄 Error validating deployment {dseq}, clearing state")
+                self.clear_state()
+        
+        # No valid state file or state was cleared, query blockchain for ANY active deployments
+        self.logger.info("🔍 No valid local state, querying blockchain for active deployments...")
+        if not self.wallet_address:
+            self.logger.debug("Wallet address not available yet")
+            return False, None
+            
+        try:
+            success, result = self.execute_query(['query', 'deployment', 'list', '--owner', self.wallet_address])
+            
+            if success and isinstance(result, dict):
+                deployments = result.get('deployments', [])
+                self.logger.debug(f"Found {len(deployments)} total deployments for this wallet")
+                
+                # Look for active deployments
+                for deployment_entry in deployments:
+                    deployment = deployment_entry.get('deployment', {})
                     deployment_id = deployment.get('deployment_id', {})
                     state = deployment.get('state', '').lower()
+                    dseq = deployment_id.get('dseq')
                     
-                    self.logger.debug(f"Parsed deployment - DSEQ: {deployment_id.get('dseq')}, State: '{state}'")
-                    
-                    if state == 'active':
-                        self.logger.info(f"✅ Verified active deployment: DSEQ {dseq}")
+                    if state == 'active' and dseq:
+                        self.logger.info(f"✅ Found active deployment on blockchain: DSEQ {dseq}")
+                        
+                        # Query for lease information to get provider details
+                        provider_info = self._get_lease_info_for_deployment(str(dseq))
+                        
+                        # Reconstruct deployment_info and save it
+                        deployment_info = {
+                            'dseq': str(dseq),
+                            'owner': self.wallet_address,
+                            'manifest_path': self.yaml_file or 'unknown'
+                        }
+                        
+                        # Add lease/provider info if found
+                        if provider_info:
+                            deployment_info.update(provider_info)
+                        
+                        self.save_state(deployment_info)
+                        
                         return True, deployment_info
-                    else:
-                        self.logger.info(f"🔄 Deployment {dseq} is no longer active (state: '{state}'), clearing state")
-                        self.clear_state()
-                        return False, None
-                else:
-                    self.logger.warning(f"🔄 Unexpected deployment data structure, clearing state")
-                    self.clear_state()
-                    return False, None
+                
+                self.logger.debug("No active deployments found on blockchain")
+                return False, None
             else:
-                self.logger.info(f"🔄 Could not verify deployment {dseq}, clearing state")
-                self.clear_state()
+                self.logger.debug("Failed to query deployments from blockchain")
                 return False, None
                 
         except Exception as e:
-            self.logger.warning(f"Error validating deployment {dseq}: {e}")
-            self.logger.info(f"🔄 Error validating deployment {dseq}, clearing state")
-            self.clear_state()
+            self.logger.warning(f"Error querying blockchain for active deployments: {e}")
             return False, None
 
     def create_deployment(self):
@@ -1281,8 +1370,20 @@ class AkashDeployer:
         self.logger.error(f"❌ Deployment failed to become ready within {timeout} seconds")
         return None
 
-    def get_service_url_from_lease(self, dseq):
-        """Get service URL from lease status"""
+    def get_service_url_from_lease(self, dseq, deployment_info=None):
+        """Get service URL from lease status
+        
+        Args:
+            dseq: Deployment sequence number
+            deployment_info: Optional deployment info dict containing provider details.
+                           If not provided, will load from state file.
+        """
+        # Save deployment_info temporarily if provided (so check_service_status can use it)
+        temp_state_saved = False
+        if deployment_info and deployment_info.get('provider'):
+            self.save_state(deployment_info)
+            temp_state_saved = True
+        
         status_result = self.check_service_status(dseq)
         if status_result.get('success'):
             service_uris = status_result.get('service_uris', {})
@@ -1314,7 +1415,19 @@ class AkashDeployer:
     def run(self):
         """Main deployment workflow"""
         try:
-            # Check for existing active deployment
+            # IMPORTANT: Restore wallet FIRST so we have wallet_address for checking existing deployments
+            if not self.restore_wallet():
+                return {
+                    'success': False,
+                    'message': 'Deployment failed',
+                    'error': 'Wallet restoration failed',
+                    'deployment_info': None,
+                    'lease_info': None,
+                    'service_url': None,
+                    'api_credentials': None
+                }
+
+            # Now check for existing active deployment (wallet_address is set)
             has_active, active_deployment_info = self.has_active_deployment()
             if has_active and active_deployment_info:
                 # We have a verified active deployment
@@ -1324,7 +1437,8 @@ class AkashDeployer:
                 # Get service URL if not already in state
                 service_url = active_deployment_info.get('service_url', '')
                 if not service_url:
-                    service_url = self.get_service_url_from_lease(dseq)
+                    # Pass deployment_info so check_service_status has access to provider details
+                    service_url = self.get_service_url_from_lease(dseq, active_deployment_info)
                     if service_url:
                         # Update state with service URL
                         active_deployment_info['service_url'] = service_url
@@ -1351,17 +1465,7 @@ class AkashDeployer:
                     'message': f"Using existing active deployment: DSEQ {dseq}"
                 }
 
-            if not self.restore_wallet():
-                return {
-                    'success': False,
-                    'message': 'Deployment failed',
-                    'error': 'Wallet restoration failed',
-                    'deployment_info': None,
-                    'lease_info': None,
-                    'service_url': None,
-                    'api_credentials': None
-                }
-
+            # No existing deployment found, continue with checks for new deployment
             if self.get_wallet_balance() < 1000000:
                 return {
                     'success': False,
@@ -1507,9 +1611,16 @@ The deployment is ready to use.
         """Close deployment"""
         try:
             if not dseq:
-                dseq, _ = self.get_active_deployment_info()
-                if not dseq:
+                # Restore wallet first to have wallet_address for queries
+                if not self.restore_wallet():
+                    return {'success': False, 'error': 'Wallet restoration failed'}
+                
+                # Check for active deployment (this will query blockchain if needed)
+                has_active, deployment_info = self.has_active_deployment()
+                if not has_active or not deployment_info:
                     return {'success': False, 'error': 'No active deployment found'}
+                
+                dseq = deployment_info.get('dseq')
 
             self.logger.info(f"🛑 Closing deployment {dseq}...")
             
@@ -1604,9 +1715,18 @@ Deployment closed and wallet cleaned up.
 
     def get_lease_status(self):
         """Get lease status"""
-        dseq, provider = self.get_active_deployment_info()
-        if not dseq:
+        # Restore wallet first to have wallet_address for queries
+        if not self.restore_wallet():
+            return {'success': False, 'error': 'Wallet restoration failed'}
+        
+        # Check for active deployment (this will query blockchain if needed)
+        has_active, deployment_info = self.has_active_deployment()
+        if not has_active or not deployment_info:
             return {'success': False, 'error': 'No active deployment found'}
+        
+        dseq = deployment_info.get('dseq')
+        provider = deployment_info.get('provider', '')
+        
         if not provider:
             return {'success': False, 'error': 'Provider not found'}
 
@@ -1623,16 +1743,22 @@ Deployment closed and wallet cleaned up.
 
     def get_lease_logs(self, follow=False, tail_lines=100):
         """Get lease logs"""
-        dseq, provider = self.get_active_deployment_info()
+        # Restore wallet first to have wallet_address for queries
+        if not self.restore_wallet():
+            return {'success': False, 'error': 'Wallet restoration failed'}
+        
+        # Check for active deployment (this will query blockchain if needed)
+        has_active, deployment_info = self.has_active_deployment()
+        if not has_active or not deployment_info:
+            return {'success': False, 'error': 'No active deployment found'}
+        
+        dseq = deployment_info.get('dseq')
+        provider = deployment_info.get('provider', '')
+        gseq = deployment_info.get('gseq', '1')
+        oseq = deployment_info.get('oseq', '1')
+        
         if not dseq or not provider:
             return {'success': False, 'error': 'No active deployment found'}
-
-        # Get gseq and oseq from state
-        deployment_state = self.load_state()
-        if not deployment_state:
-            return {'success': False, 'error': 'No deployment state found'}
-        gseq = deployment_state.get('gseq', '1')
-        oseq = deployment_state.get('oseq', '1')
 
         cmd = [
             'provider-services', 'lease-logs',
@@ -1652,14 +1778,19 @@ Deployment closed and wallet cleaned up.
 
     def get_interactive_shell(self, service_name='comfyui'):
         """Get interactive shell into the container"""
-        deployment_state = self.load_state()
-        if not deployment_state:
+        # Restore wallet first to have wallet_address for queries
+        if not self.restore_wallet():
+            return {'success': False, 'error': 'Wallet restoration failed'}
+        
+        # Check for active deployment (this will query blockchain if needed)
+        has_active, deployment_info = self.has_active_deployment()
+        if not has_active or not deployment_info:
             return {'success': False, 'error': 'No active deployment found'}
 
-        dseq = deployment_state.get('dseq')
-        provider = deployment_state.get('provider')
-        gseq = deployment_state.get('gseq', '1')
-        oseq = deployment_state.get('oseq', '1')
+        dseq = deployment_info.get('dseq')
+        provider = deployment_info.get('provider')
+        gseq = deployment_info.get('gseq', '1')
+        oseq = deployment_info.get('oseq', '1')
 
         if not dseq or not provider:
             return {'success': False, 'error': 'Missing deployment info'}
@@ -1820,22 +1951,35 @@ def main():
     deployer = AkashDeployer(debug_mode=args.debug, yaml_content=args.yaml, yaml_file=args.yaml_file)
 
     try:
+        result = None
+        
         if args.rpc_info:
             result = {'selected_node': deployer.akash_node, 'available_nodes': AKASH_RPC_NODES}
         elif args.dry_run:
             result = deployer.dry_run()
-        elif args.close:
-            result = deployer.close_deployment()
-        elif args.status:
-            result = deployer.get_lease_status()
-        elif args.logs:
-            result = deployer.get_lease_logs()
-        elif args.shell:
-            # Note: get_interactive_shell() uses os.execvp and won't return
-            result = deployer.get_interactive_shell()
+        elif args.close or args.status or args.logs or args.shell:
+            # These commands need wallet restored to access deployment info
+            if not deployer.restore_wallet():
+                result = {
+                    'success': False,
+                    'error': 'Wallet restoration failed',
+                    'message': 'Cannot access deployment information without wallet'
+                }
+            elif args.close:
+                result = deployer.close_deployment()
+            elif args.status:
+                result = deployer.get_lease_status()
+            elif args.logs:
+                result = deployer.get_lease_logs()
+            elif args.shell:
+                # Note: get_interactive_shell() uses os.execvp and won't return
+                result = deployer.get_interactive_shell()
         else:
             # Production deployment
             result = deployer.run()
+        
+        if result is None:
+            result = {'success': False, 'error': 'Unknown command'}
 
         print(json.dumps(result, indent=2))
         sys.exit(0 if result.get('success', False) else 1)

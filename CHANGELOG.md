@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Deployment detection**: Fixed critical issue where script would create new deployments even when an active deployment existed on the blockchain. Three fixes were applied:
+  1. Wallet is now restored BEFORE checking for deployments (was checked after, causing `self.wallet_address` to be `None`)
+  2. Added blockchain query fallback - if local state file is missing or points to closed deployment, script now queries blockchain for any active deployments
+  3. When reconstructing deployment from blockchain, script now queries lease information to get provider/gseq/oseq details needed for service status queries
+- **Service URL retrieval**: Script now properly retrieves service URL and generates API credentials with actual URL (not placeholder) when using existing deployments found on blockchain
+
 ## [1.0.1] - 2025-10-13
 
 ### Fixed
