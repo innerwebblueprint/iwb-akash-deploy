@@ -4,7 +4,7 @@ iwb-akash-deploy.py - Compact Akash Deployment Script
 Deploy ComfyUI instances to Akash Network for n8n workflows
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 import os, sys, json, subprocess, time, secrets, string, argparse, requests, concurrent.futures
 import stat, shutil, traceback, logging, yaml, tempfile
