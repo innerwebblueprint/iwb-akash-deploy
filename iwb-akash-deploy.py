@@ -1788,6 +1788,27 @@ class AkashDeployer:
                 final_deployment_state['status'] = 'starting'
                 self.save_state(final_deployment_state)
             
+            # Send deployment started notification email
+            try:
+                subject = f"Akash Deployment {dseq} Started"
+                body = f"""ComfyUI Deployment Started
+
+DSEQ: {dseq}
+Provider: {provider}
+Status: Starting (services launching in background)
+Time: {datetime.now(timezone.utc).isoformat()}Z
+
+API Credentials:
+- Username: {api_credentials['username']}
+- Password: {api_credentials['password']}
+
+The deployment is starting. Services will be available once fully initialized.
+Use --check-ready to monitor deployment status.
+"""
+                self.send_email(subject, body)
+            except Exception as e:
+                self.logger.warning(f"⚠️ Could not send deployment notification: {e}")
+            
             return {
                 'success': True,
                 'message': 'Deployment started successfully. Use --check-ready to verify when ready.',

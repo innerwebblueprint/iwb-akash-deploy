@@ -35,17 +35,60 @@ source test-env-vars.sh
 ```
 
 ## Running Commands
-**CORRECT way to run the script:**
+
+### Local Testing
+**CORRECT way to run the script locally:**
 ```bash
 source test-env-vars.sh && python3 iwb-akash-deploy.py -f test.yml
+```
+
+**Other local commands:**
+```bash
+# Close deployment
+source test-env-vars.sh && python3 iwb-akash-deploy.py --close
+
+# Check if deployment is ready
+source test-env-vars.sh && python3 iwb-akash-deploy.py --check-ready
+
+# Dry run (test without creating deployment)
+source test-env-vars.sh && python3 iwb-akash-deploy.py -f test.yml --dry-run
+
+# Debug mode
+source test-env-vars.sh && python3 iwb-akash-deploy.py -f test.yml --debug
 ```
 
 **WRONG ways (DO NOT USE):**
 - ❌ `python3 iwb-akash-deploy.py -f test.yml` (without sourcing env vars first)
 - ❌ `export COMPOSE_PROJECT_NAME=tdk && python3 ...` (export doesn't persist to Python subprocess)
 
+### Remote Server Testing
+**SSH to remote server and execute commands in container:**
+
+```bash
+# Basic SSH connection
+ssh iwb001
+
+# Check recent deployment logs
+ssh iwb001 'sudo docker exec -u n8n tdk-iwbdpp-1 bash -c "ls -lht /home/n8n/iwb-akash-deploy*.log | head -3"'
+
+# View specific deployment log
+ssh iwb001 'sudo docker exec -u n8n tdk-iwbdpp-1 bash -c "cat /home/n8n/iwb-akash-deploy_DSEQ.log"'
+
+# Search logs for specific content
+ssh iwb001 'sudo docker exec -u n8n tdk-iwbdpp-1 bash -c "grep -E \"pattern\" /home/n8n/iwb-akash-deploy_DSEQ.log"'
+
+# Check active deployment state
+ssh iwb001 'sudo docker exec -u n8n tdk-iwbdpp-1 bash -c "cat /home/n8n/active-deployment.json | jq ."'
+
+# Query provider attributes
+ssh iwb001 'sudo docker exec -u n8n tdk-iwbdpp-1 bash -c "provider-services query provider get PROVIDER_ADDRESS --node https://rpc.akashnet.net:443 --output json | jq \".attributes[:15]\""'
+
+# Check lease status on remote
+ssh iwb001 'sudo docker exec -u n8n tdk-iwbdpp-1 bash -c "provider-services lease-status --dseq DSEQ --gseq 1 --oseq 1 --provider PROVIDER_ADDRESS --keyring-backend test --from tdkakashwallet --node https://rpc.akashnet.net:443 --auth-type mtls"'
+```
+
 ## Testing Commands
-**Check lease status:**
+**Check lease status locally:**
 ```bash
 source test-env-vars.sh
 provider-services lease-status --dseq 12645678 --gseq 1 --oseq 1 \

@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Close deployment JSON output**: Fixed crash when closing deployments
+  - Added proper null/type checking before parsing transaction output
+  - Script now returns proper JSON for n8n instead of AttributeError traceback
+  - Deployment closes successfully even when transaction output is None or unparseable
+  - Handles cases where `execute_tx()` returns None for stdout
+
+- **Email notifications**: Re-enabled email notifications for deployments
+  - Added email notification when deployment starts (async mode compatible)
+  - Email includes DSEQ, provider, API credentials, and timestamp
+  - Close deployment emails now work (previously crashed before sending)
+  - Both notifications use system `mail` command with IWB_DOMAIN config
+
 ## [1.1.3] - 2025-10-20
 
 ### Fixed
