@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.4] - 2025-10-20
+
 ### Fixed
 - **Close deployment JSON output**: Fixed crash when closing deployments
   - Added proper null/type checking before parsing transaction output
