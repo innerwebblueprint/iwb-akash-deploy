@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.2] - 2025-10-20
+
 ### Added
 - **Deployment creation timeout resilience**: RPC timeouts no longer cause deployment failures
   - New `_find_recent_deployment()` method queries blockchain for recently created deployments
