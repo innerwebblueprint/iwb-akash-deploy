@@ -1886,13 +1886,15 @@ class AkashDeployer:
                 lease_cost_akt = 0.0
                 
                 try:
-                    tx_data = json.loads(stdout)
-                    fee_info = tx_data.get('tx', {}).get('auth_info', {}).get('fee', {})
-                    for amount in fee_info.get('amount', []):
-                        if amount.get('denom') == 'uakt':
-                            tx_fee_akt = float(amount['amount']) / 1000000
-                            break
-                except (json.JSONDecodeError, KeyError):
+                    if stdout:
+                        tx_data = json.loads(stdout)
+                        if tx_data and isinstance(tx_data, dict):
+                            fee_info = tx_data.get('tx', {}).get('auth_info', {}).get('fee', {})
+                            for amount in fee_info.get('amount', []):
+                                if amount.get('denom') == 'uakt':
+                                    tx_fee_akt = float(amount['amount']) / 1000000
+                                    break
+                except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
                     pass
                 
                 # Wait for blockchain confirmation then query actual lease cost
