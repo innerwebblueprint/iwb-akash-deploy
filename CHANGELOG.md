@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.3] - 2025-10-20
+
 ### Fixed
 - **GPU model detection**: Fixed critical bug where all provider GPU models showed as "Unknown"
   - Added `_extract_gpu_model()` method to parse GPU models from Akash attribute keys
