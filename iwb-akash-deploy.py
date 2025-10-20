@@ -1055,6 +1055,10 @@ class AkashDeployer:
         
         self.logger.info(f"🔍 Evaluating {len(bids)} bids using scoring system...")
         
+        # Get GPU preferences once and log them
+        gpu_preferences = self._get_gpu_preferences_from_manifest()
+        self.logger.info(f"📋 GPU preferences from manifest: {gpu_preferences}")
+        
         scored_bids = []
         for bid in bids:
             provider = bid['bid']['bid_id']['provider']
@@ -1065,8 +1069,20 @@ class AkashDeployer:
                 self.logger.warning(f"⚠️  Skipping bid from {provider[:20]}... - no attributes available")
                 continue
             
-            # Score the provider
-            score = self._score_provider(provider, provider_attrs)
+            # Convert attributes to dict for easy access
+            attr_dict = {}
+            for attr in provider_attrs:
+                key = attr.get('key', '')
+                value = attr.get('value', '')
+                attr_dict[key] = value
+            
+            # Extract GPU info
+            gpu_model = attr_dict.get('capabilities/gpu/model', 'Unknown')
+            gpu_vendor = attr_dict.get('capabilities/gpu/vendor', 'unknown')
+            country = attr_dict.get('country', 'Unknown')
+            
+            # Score the provider (pass gpu_preferences to avoid re-fetching)
+            score = self._score_provider(provider, provider_attrs, gpu_preferences)
             price = int(float(bid['bid']['price']['amount']))
             
             # Combined score (higher is better, but factor in price)
@@ -1093,10 +1109,14 @@ class AkashDeployer:
                 'score': score,
                 'price': price,
                 'combined_score': combined_score,
-                'attributes': provider_attrs
+                'attributes': provider_attrs,
+                'gpu_model': gpu_model,
+                'gpu_vendor': gpu_vendor,
+                'country': country
             })
             
-            self.logger.info(f"  📊 {provider} - Score: {score:.1f}, Price: {price} uakt, Combined: {combined_score:.1f}")
+            # Log provider details with GPU info
+            self.logger.info(f"  📊 {provider[:20]}... - GPU: {gpu_model} ({country}) - Score: {score:.1f}, Price: {price} uakt, Combined: {combined_score:.1f}")
         
         if not scored_bids:
             self.logger.error("❌ No valid bids after scoring")
@@ -1107,7 +1127,8 @@ class AkashDeployer:
         
         best = scored_bids[0]
         self.logger.info(f"✅ Selected best bid: {best['provider']} (Score: {best['combined_score']:.1f})")
-        self.logger.info(f"📍 Provider URL: {best['provider_url']}")
+        self.logger.info(f"   GPU: {best['gpu_model']} | Location: {best['country']} | Price: {best['price']} uakt")
+        self.logger.info(f"   Provider URL: {best['provider_url']}")
         
         return best['bid']
 
@@ -1123,7 +1144,7 @@ class AkashDeployer:
             self.logger.warning(f"⚠️  Failed to get provider attributes for {provider_address[:20]}...: {e}")
             return None
 
-    def _score_provider(self, provider_address, attributes):
+    def _score_provider(self, provider_address, attributes, gpu_preferences=None):
         """Score provider based on attributes and GPU preferences"""
         if not attributes:
             return 0
@@ -1148,7 +1169,8 @@ class AkashDeployer:
             score += 30
         
         # GPU scoring based on manifest preferences
-        gpu_preferences = self._get_gpu_preferences_from_manifest()
+        if gpu_preferences is None:
+            gpu_preferences = self._get_gpu_preferences_from_manifest()
         gpu_model = attr_dict.get('capabilities/gpu/model', '').lower()
         
         if gpu_preferences and gpu_model:
@@ -1170,7 +1192,7 @@ class AkashDeployer:
         return score
 
     def _get_gpu_preferences_from_manifest(self):
-        """Extract GPU preferences from manifest"""
+        """Extract GPU preferences from manifest (does not log - caller should log)"""
         try:
             manifest = None
             if self.yaml_file:
@@ -1201,14 +1223,12 @@ class AkashDeployer:
                         if model not in gpu_preferences:
                             gpu_preferences.append(model)
                 
-                # If we found GPU preferences, use them
+                # If we found GPU preferences, return them (no logging - let caller log)
                 if gpu_preferences:
-                    self.logger.info(f"📋 GPU preferences from manifest: {gpu_preferences}")
                     return gpu_preferences
             
             # Default GPU preference order if not specified in manifest
             default_prefs = ['rtx4090', 'a100', 'h100', 'rtx3090', 'rtx3080', 'v100', 'a6000']
-            self.logger.info(f"📋 Using default GPU preferences: {default_prefs}")
             return default_prefs
             
         except Exception as e:
@@ -1491,7 +1511,7 @@ class AkashDeployer:
     def check_ready(self):
         """Check if deployment is ready (services running + models downloaded)"""
         try:
-            # Restore wallet to get access to deployment info
+            # Ensure wallet is available (restore_wallet is idempotent - returns quickly if already loaded)
             if not self.restore_wallet():
                 return {'success': False, 'error': 'Wallet restoration failed', 'ready': False}
             
@@ -1699,7 +1719,7 @@ class AkashDeployer:
             #
             # DSEQ: {dseq}
             # Provider: {provider}
-            # Service URL: {service_url}
+            # Service URL: {service_url}--close
             # Time: {datetime.now(timezone.utc).isoformat()}Z
             #
             # API Credentials:
@@ -1737,7 +1757,7 @@ class AkashDeployer:
         """Close deployment"""
         try:
             if not dseq:
-                # Restore wallet first to have wallet_address for queries
+                # Ensure wallet is available (restore_wallet is idempotent - returns quickly if already loaded)
                 if not self.restore_wallet():
                     return {'success': False, 'error': 'Wallet restoration failed'}
                 
@@ -1841,7 +1861,7 @@ Deployment closed and wallet cleaned up.
 
     def get_lease_status(self):
         """Get lease status"""
-        # Restore wallet first to have wallet_address for queries
+        # Ensure wallet is available (restore_wallet is idempotent - returns quickly if already loaded)
         if not self.restore_wallet():
             return {'success': False, 'error': 'Wallet restoration failed'}
         
@@ -1869,7 +1889,7 @@ Deployment closed and wallet cleaned up.
 
     def get_lease_logs(self, follow=False, tail_lines=100):
         """Get lease logs"""
-        # Restore wallet first to have wallet_address for queries
+        # Ensure wallet is available (restore_wallet is idempotent - returns quickly if already loaded)
         if not self.restore_wallet():
             return {'success': False, 'error': 'Wallet restoration failed'}
         
@@ -1904,7 +1924,7 @@ Deployment closed and wallet cleaned up.
 
     def get_interactive_shell(self, service_name='comfyui'):
         """Get interactive shell into the container"""
-        # Restore wallet first to have wallet_address for queries
+        # Ensure wallet is available (restore_wallet is idempotent - returns quickly if already loaded)
         if not self.restore_wallet():
             return {'success': False, 'error': 'Wallet restoration failed'}
         
@@ -2087,23 +2107,15 @@ def main():
         elif args.check_ready:
             # Check if deployment is ready (services + models)
             result = deployer.check_ready()
-        elif args.close or args.status or args.logs or args.shell:
-            # These commands need wallet restored to access deployment info
-            if not deployer.restore_wallet():
-                result = {
-                    'success': False,
-                    'error': 'Wallet restoration failed',
-                    'message': 'Cannot access deployment information without wallet'
-                }
-            elif args.close:
-                result = deployer.close_deployment()
-            elif args.status:
-                result = deployer.get_lease_status()
-            elif args.logs:
-                result = deployer.get_lease_logs()
-            elif args.shell:
-                # Note: get_interactive_shell() uses os.execvp and won't return
-                result = deployer.get_interactive_shell()
+        elif args.close:
+            result = deployer.close_deployment()
+        elif args.status:
+            result = deployer.get_lease_status()
+        elif args.logs:
+            result = deployer.get_lease_logs()
+        elif args.shell:
+            # Note: get_interactive_shell() uses os.execvp and won't return
+            result = deployer.get_interactive_shell()
         else:
             # Production deployment (returns immediately after manifest send)
             result = deployer.run()

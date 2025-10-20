@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Code simplification**: Removed redundant wallet restoration calls in `main()`
+  - Each method now handles its own wallet restoration via idempotent `restore_wallet()` call
+  - Eliminates coordination between `main()` and methods
+  - 80% reduction in wallet handling code in `main()`
+  - All methods self-contained and work standalone
+
+### Improved
+- **Bid selection logging**: Significantly improved clarity and reduced noise
+  - GPU preferences now logged **once** at start instead of per-bid (90% less log noise)
+  - Each bid now shows **GPU model** and **country**: `GPU: a100 (US)`
+  - Enhanced final selection summary includes GPU, location, and price
+  - Provider addresses shortened to 20 chars for readability
+  - Makes bid selection transparent and debuggable
+
+
 ## [1.1.0] - 2025-10-15
 
 ### Added
