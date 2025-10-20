@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.1] - 2025-10-19
+
 ### Changed
 - **Code simplification**: Removed redundant wallet restoration calls in `main()`
   - Each method now handles its own wallet restoration via idempotent `restore_wallet()` call
