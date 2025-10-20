@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **GPU model detection**: Fixed critical bug where all provider GPU models showed as "Unknown"
+  - Added `_extract_gpu_model()` method to parse GPU models from Akash attribute keys
+  - Akash stores GPU info as keys like `capabilities/gpu/vendor/nvidia/model/a100`, not as values
+  - Script was looking for `capabilities/gpu/model` attribute (doesn't exist)
+  - GPU-based scoring now works correctly: RTX 4090 (100pts), A100 (90pts), H100 (80pts), etc.
+  - Providers are now properly prioritized by GPU model according to manifest preferences
+  - Bug caused cheapest US provider to win regardless of GPU type (only location scored)
+
 ## [1.1.2] - 2025-10-20
 
 ### Added

@@ -1156,8 +1156,8 @@ class AkashDeployer:
                 value = attr.get('value', '')
                 attr_dict[key] = value
             
-            # Extract GPU info
-            gpu_model = attr_dict.get('capabilities/gpu/model', 'Unknown')
+            # Extract GPU info using the helper method
+            gpu_model = self._extract_gpu_model(provider_attrs)
             gpu_vendor = attr_dict.get('capabilities/gpu/vendor', 'unknown')
             country = attr_dict.get('country', 'Unknown')
             
@@ -1224,6 +1224,29 @@ class AkashDeployer:
             self.logger.warning(f"⚠️  Failed to get provider attributes for {provider_address[:20]}...: {e}")
             return None
 
+    def _extract_gpu_model(self, attributes):
+        """Extract GPU model from provider attributes.
+        
+        GPU models are stored as keys like:
+        - capabilities/gpu/vendor/nvidia/model/a100
+        - capabilities/gpu/vendor/nvidia/model/rtx3090
+        """
+        if not attributes:
+            return 'Unknown'
+        
+        for attr in attributes:
+            key = attr.get('key', '')
+            # Look for keys matching the pattern: capabilities/gpu/vendor/nvidia/model/XXX
+            if key.startswith('capabilities/gpu/vendor/nvidia/model/'):
+                # Extract the model name from the key
+                # Example: capabilities/gpu/vendor/nvidia/model/a100 -> a100
+                parts = key.split('/')
+                if len(parts) >= 6:
+                    model = parts[5]  # The model name is at index 5
+                    return model
+        
+        return 'Unknown'
+
     def _score_provider(self, provider_address, attributes, gpu_preferences=None):
         """Score provider based on attributes and GPU preferences"""
         if not attributes:
@@ -1251,9 +1274,11 @@ class AkashDeployer:
         # GPU scoring based on manifest preferences
         if gpu_preferences is None:
             gpu_preferences = self._get_gpu_preferences_from_manifest()
-        gpu_model = attr_dict.get('capabilities/gpu/model', '').lower()
         
-        if gpu_preferences and gpu_model:
+        # Extract GPU model from attributes
+        gpu_model = self._extract_gpu_model(attributes).lower()
+        
+        if gpu_preferences and gpu_model and gpu_model != 'unknown':
             for i, preferred_gpu in enumerate(gpu_preferences):
                 if preferred_gpu.lower() in gpu_model:
                     # Higher score for higher priority GPUs
