@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Deployment creation timeout resilience**: RPC timeouts no longer cause deployment failures
+  - New `_find_recent_deployment()` method queries blockchain for recently created deployments
+  - Retry logic: 3 attempts with 5-second waits (15 seconds total) to find deployment after timeout
+  - Distinguishes between RPC timeout (transaction succeeded) and real failures
+  - Automatic recovery when deployment exists despite RPC timeout
+  - Clear logging of recovery attempts and final outcome
+  - Also serves as fallback when DSEQ parsing fails from successful output
+
+### Improved
+- **Resilient deployment workflow**: Script continues even when RPC nodes are slow/timeout
+  - Detects "timed out waiting for tx to be included in a block" errors
+  - Queries blockchain to verify if deployment was actually created
+  - Continues with bid selection if deployment found (avoids duplicate deployments)
+  - Only reports failure if deployment truly not created after all retry attempts
+  - Better cost efficiency - no wasted AKT on abandoned successful deployments
+
 ## [1.1.1] - 2025-10-19
 
 ### Changed

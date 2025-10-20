@@ -9,6 +9,20 @@ The script expects a properly formated Akash SDL passed using the appropriate fl
 -f, --file FILE       Path to Akash SDL YAML file
 -y YAML, --yaml YAML  Custom YAML manifest
 
+# WORKFLOW GUIDELINES
+
+## Documentation and Summaries
+⚠️ **IMPORTANT**: Always ASK the user if they want a summary/documentation created BEFORE making it.
+- Only create summary documents AFTER all logic edits are complete
+- Do not automatically create markdown summaries unless specifically requested
+- Wait for user confirmation before generating documentation
+
+## Changelog and Commits
+When updating CHANGELOG.md:
+1. Add the changes to the changelog
+2. **Always provide a suggested commit message** at the end
+3. Format commit message suggestions clearly and ready to use
+
 # IMPORTANT NOTES - DO NOT FORGET
 
 ## ⚠️ CRITICAL: When Running Locally Always Source Environment Variables First !
@@ -42,6 +56,29 @@ provider-services lease-status --dseq 12645678 --gseq 1 --oseq 1 \
 
 
 ## Recent Fixes
+
+### ✅ Fixed: Deployment creation timeout resilience with retry logic (2025-10-20)
+
+**Problem**: When creating a deployment, RPC node timeouts could cause the script to fail even though the deployment was successfully created on-chain. The error was:
+```
+Error: RPC error -32603 - Internal error: timed out waiting for tx to be included in a block
+```
+The transaction was actually submitted and processed successfully, but the script terminated before receiving confirmation. Bids were received but the script couldn't continue.
+
+**Solution**: 
+1. **Timeout Detection**: Enhanced `create_deployment()` to distinguish timeout errors from actual failures
+2. **Retry Logic**: Implemented 3-attempt retry with 5-second waits between attempts (15 seconds total)
+3. **Blockchain Verification**: Added `_find_recent_deployment()` method to query blockchain for recently created deployments
+4. **Graceful Recovery**: When timeout detected, script queries blockchain to verify deployment exists and continues workflow
+5. **DSEQ Parsing Fallback**: Even on successful creation, if DSEQ can't be parsed, falls back to blockchain query
+
+**Result**: Script now gracefully handles RPC timeouts:
+- Detects timeout vs real failure
+- Retries up to 3 times with blockchain queries
+- Finds the most recent active deployment
+- Continues with bid selection if deployment exists
+- Clear logging of recovery attempts
+- Only fails if deployment truly wasn't created after all attempts
 
 ### ✅ Fixed: Local certificate files now properly managed (2025-10-14)
 

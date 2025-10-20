@@ -949,23 +949,103 @@ class AkashDeployer:
         
         return None
 
+    def _find_recent_deployment(self):
+        """
+        Query blockchain for the most recent active deployment for this wallet.
+        Used as fallback when deployment creation times out or DSEQ can't be parsed.
+        Returns DSEQ as string or None if no deployment found.
+        """
+        try:
+            self.logger.debug("Querying blockchain for recent deployments...")
+            success, result = self.execute_query(['query', 'deployment', 'list', '--owner', self.wallet_address])
+            
+            if not success or not isinstance(result, dict):
+                self.logger.debug(f"Failed to query deployments: {result}")
+                return None
+            
+            deployments = result.get('deployments', [])
+            if not deployments:
+                self.logger.debug("No deployments found on blockchain")
+                return None
+            
+            # Find most recent active deployment
+            active_deployments = []
+            for dep_wrapper in deployments:
+                deployment = dep_wrapper.get('deployment', {})
+                state = deployment.get('state', 'unknown')
+                
+                # Check if deployment is active (newly created deployments are in 'active' state)
+                if state == 'active':
+                    dseq = deployment.get('deployment_id', {}).get('dseq')
+                    if dseq:
+                        active_deployments.append(str(dseq))
+            
+            if active_deployments:
+                # Return the highest DSEQ (most recent)
+                most_recent = max(active_deployments, key=lambda x: int(x))
+                self.logger.debug(f"Found recent active deployment: DSEQ {most_recent}")
+                return most_recent
+            
+            self.logger.debug("No active deployments found")
+            return None
+            
+        except Exception as e:
+            self.logger.warning(f"Error querying for recent deployment: {e}")
+            return None
+
     def create_deployment(self):
-        """Create deployment"""
+        """Create deployment with resilient timeout handling"""
         self.logger.info("📦 Creating deployment...")
         manifest_path = self.create_deployment_manifest(self.generate_api_credentials())
         success, stdout, stderr = self.execute_tx(['tx', 'deployment', 'create', manifest_path])
         
+        # Check if this is a timeout error (transaction might still succeed)
+        is_timeout = 'timed out waiting for tx' in stderr.lower() or 'timeout' in stderr.lower()
+        
         if not success:
-            self.logger.error(f"❌ Deployment creation failed: {stderr}")
-            return {'success': False, 'error': f'Deployment creation failed: {stderr}'}
+            if is_timeout:
+                self.logger.warning(f"⚠️  RPC timeout during deployment creation: {stderr}")
+                self.logger.info("🔍 Checking blockchain for deployment creation despite timeout...")
+                
+                # Retry up to 3 times with 5-second waits
+                max_retries = 3
+                dseq = None
+                
+                for attempt in range(1, max_retries + 1):
+                    self.logger.info(f"   Attempt {attempt}/{max_retries}: Waiting 5 seconds for blockchain propagation...")
+                    time.sleep(5)
+                    
+                    # Query blockchain for recent deployments
+                    dseq = self._find_recent_deployment()
+                    
+                    if dseq:
+                        self.logger.info(f"✅ Deployment was created successfully despite timeout: DSEQ {dseq}")
+                        deployment_info = {'dseq': dseq, 'owner': self.wallet_address, 'manifest_path': manifest_path}
+                        self.save_state(deployment_info)
+                        return {'success': True, 'deployment_info': deployment_info}
+                    else:
+                        if attempt < max_retries:
+                            self.logger.debug(f"   No deployment found yet, retrying...")
+                        else:
+                            self.logger.error("❌ No deployment found on blockchain after 3 attempts")
+                
+                return {'success': False, 'error': f'Deployment creation timed out and no deployment found after {max_retries} attempts: {stderr}'}
+            else:
+                # Non-timeout error
+                self.logger.error(f"❌ Deployment creation failed: {stderr}")
+                return {'success': False, 'error': f'Deployment creation failed: {stderr}'}
 
         self.logger.debug(f"Deployment creation output: {stdout}")
         
         # Parse DSEQ from output
         dseq = self._parse_dseq_from_output(stdout)
         if not dseq:
-            self.logger.error(f"Failed to parse DSEQ from output: {stdout}")
-            return {'success': False, 'error': f'Failed to parse deployment output. Raw output: {stdout}'}
+            self.logger.warning(f"Could not parse DSEQ from output, checking blockchain...")
+            dseq = self._find_recent_deployment()
+            
+            if not dseq:
+                self.logger.error(f"Failed to parse DSEQ from output: {stdout}")
+                return {'success': False, 'error': f'Failed to parse deployment output. Raw output: {stdout}'}
 
         self.logger.info(f"✅ Deployment created with DSEQ: {dseq}")
         deployment_info = {'dseq': dseq, 'owner': self.wallet_address, 'manifest_path': manifest_path}
