@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **GPU preference scoring**: Fixed organization bonus overriding GPU preferences
+  - Increased GPU preference score gap from 10 to 30 points per position
+  - Reduced organization bonuses (overclock: 20→10, datacenter: 15→5)
+  - RTX 4090 now always scores higher than A100, even with organization bonuses
+  - New scoring: RTX 4090=100pts, A100=70pts, H100=40pts (before org/location bonuses)
+  - Ensures manifest GPU preference order is strictly followed
+
 ## [1.1.4] - 2025-10-20
 
 ### Fixed

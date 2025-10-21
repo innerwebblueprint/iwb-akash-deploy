@@ -1281,18 +1281,18 @@ class AkashDeployer:
         if gpu_preferences and gpu_model and gpu_model != 'unknown':
             for i, preferred_gpu in enumerate(gpu_preferences):
                 if preferred_gpu.lower() in gpu_model:
-                    # Higher score for higher priority GPUs
-                    score += 100 - (i * 10)
+                    # Higher score for higher priority GPUs (larger gap to ensure GPU preference dominates)
+                    score += 100 - (i * 30)
                     break
         elif attr_dict.get('capabilities/gpu/vendor') == 'nvidia':
             score += 25  # Basic NVIDIA support
         
-        # Organization quality
+        # Organization quality (minor bonus, should not override GPU preferences)
         organization = attr_dict.get('organization', '').lower()
         if 'overclock' in organization:
-            score += 20
+            score += 10
         elif 'datacenter' in attr_dict.get('location-type', '').lower():
-            score += 15
+            score += 5
         
         return score
 
