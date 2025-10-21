@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.5] - 2025-10-20
+
 ### Fixed
 - **GPU preference scoring**: Fixed organization bonus overriding GPU preferences
   - Increased GPU preference score gap from 10 to 30 points per position
