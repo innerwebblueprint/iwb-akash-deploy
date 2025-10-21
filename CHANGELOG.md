@@ -12,6 +12,13 @@ All notable changes to this project will be documented in this file.
   - New scoring: RTX 4090=100pts, A100=70pts, H100=40pts (before org/location bonuses)
   - Ensures manifest GPU preference order is strictly followed
 
+### Improved
+- **Code optimization**: Reduced code by 12 lines while maintaining all functionality
+  - Added `_ensure_wallet_and_deployment()` helper method to eliminate repeated wallet/deployment checks
+  - Consolidated 7 instances of wallet restoration + deployment checking pattern
+  - Simplified error response handling in exception blocks
+  - Methods affected: `check_ready()`, `close_deployment()`, `get_lease_status()`, `get_lease_logs()`, `get_interactive_shell()`
+
 ## [1.1.4] - 2025-10-20
 
 ### Fixed

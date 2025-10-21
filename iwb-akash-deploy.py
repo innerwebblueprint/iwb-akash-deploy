@@ -161,9 +161,9 @@ class AkashDeployer:
         # Fallback to current directory
         return Path("./active-deployment.json")
 
-    def _error_response(self, error, deployment_info=None, lease_info=None, service_url=None, api_credentials=None):
+    def _error_response(self, error, deployment_info=None, lease_info=None, service_url=None, api_credentials=None, **kwargs):
         """Create standardized error response dict"""
-        return {
+        response = {
             'success': False,
             'message': 'Deployment failed',
             'error': error,
@@ -172,6 +172,19 @@ class AkashDeployer:
             'service_url': service_url,
             'api_credentials': api_credentials
         }
+        response.update(kwargs)  # Allow additional fields
+        return response
+    
+    def _ensure_wallet_and_deployment(self):
+        """Helper to restore wallet and get active deployment. Returns (success, deployment_info, error_response)"""
+        if not self.restore_wallet():
+            return False, None, {'success': False, 'error': 'Wallet restoration failed'}
+        
+        has_active, deployment_info = self.has_active_deployment()
+        if not has_active or not deployment_info:
+            return False, None, {'success': False, 'error': 'No active deployment found'}
+        
+        return True, deployment_info, None
 
     def _select_fastest_rpc_node(self):
         """Select fastest RPC node with proper logging"""
@@ -1616,16 +1629,15 @@ class AkashDeployer:
     def check_ready(self):
         """Check if deployment is ready (services running + models downloaded)"""
         try:
-            # Ensure wallet is available (restore_wallet is idempotent - returns quickly if already loaded)
-            if not self.restore_wallet():
-                return {'success': False, 'error': 'Wallet restoration failed', 'ready': False}
+            # Use helper to restore wallet and get deployment
+            success, deployment_info, error_response = self._ensure_wallet_and_deployment()
+            if not success:
+                if error_response:
+                    error_response['ready'] = False
+                    return error_response
+                return {'success': False, 'error': 'Unknown error', 'ready': False}
             
-            # Check for active deployment
-            has_active, deployment_info = self.has_active_deployment()
-            if not has_active or not deployment_info:
-                return {'success': False, 'error': 'No active deployment found', 'ready': False}
-            
-            dseq = deployment_info.get('dseq')
+            dseq = deployment_info.get('dseq') if deployment_info else None
             self.logger.info(f"🔍 Checking if deployment {dseq} is ready...")
             
             # Switch to dseq-specific log file
@@ -1675,8 +1687,9 @@ class AkashDeployer:
             service_url, api_credentials = self._update_deployment_metadata(deployment_info, dseq)
             
             # Update state to 'ready'
-            deployment_info['status'] = 'ready'
-            self.save_state(deployment_info)
+            if deployment_info:
+                deployment_info['status'] = 'ready'
+                self.save_state(deployment_info)
             
             self.logger.info(f"✅ Deployment {dseq} is fully ready!")
             
@@ -1869,30 +1882,18 @@ Use --check-ready to monitor deployment status.
 
         except Exception as e:
             self.logger.error(f"❌ Deployment failed: {e}")
-            return {
-                'success': False,
-                'message': 'Deployment failed with exception',
-                'error': str(e),
-                'deployment_info': None,
-                'lease_info': None,
-                'service_url': None,
-                'api_credentials': None
-            }
+            return self._error_response(f'Deployment failed with exception: {str(e)}')
 
     def close_deployment(self, dseq=None):
         """Close deployment"""
         try:
             if not dseq:
-                # Ensure wallet is available (restore_wallet is idempotent - returns quickly if already loaded)
-                if not self.restore_wallet():
-                    return {'success': False, 'error': 'Wallet restoration failed'}
+                # Use helper to restore wallet and get deployment
+                success, deployment_info, error_response = self._ensure_wallet_and_deployment()
+                if not success:
+                    return error_response if error_response else {'success': False, 'error': 'Unknown error'}
                 
-                # Check for active deployment (this will query blockchain if needed)
-                has_active, deployment_info = self.has_active_deployment()
-                if not has_active or not deployment_info:
-                    return {'success': False, 'error': 'No active deployment found'}
-                
-                dseq = deployment_info.get('dseq')
+                dseq = deployment_info.get('dseq') if deployment_info else None
 
             self.logger.info(f"🛑 Closing deployment {dseq}...")
             
@@ -1989,17 +1990,13 @@ Deployment closed and wallet cleaned up.
 
     def get_lease_status(self):
         """Get lease status"""
-        # Ensure wallet is available (restore_wallet is idempotent - returns quickly if already loaded)
-        if not self.restore_wallet():
-            return {'success': False, 'error': 'Wallet restoration failed'}
+        # Use helper to restore wallet and get deployment
+        success, deployment_info, error_response = self._ensure_wallet_and_deployment()
+        if not success:
+            return error_response if error_response else {'success': False, 'error': 'Unknown error'}
         
-        # Check for active deployment (this will query blockchain if needed)
-        has_active, deployment_info = self.has_active_deployment()
-        if not has_active or not deployment_info:
-            return {'success': False, 'error': 'No active deployment found'}
-        
-        dseq = deployment_info.get('dseq')
-        provider = deployment_info.get('provider', '')
+        dseq = deployment_info.get('dseq') if deployment_info else None
+        provider = deployment_info.get('provider', '') if deployment_info else ''
         
         if not provider:
             return {'success': False, 'error': 'Provider not found'}
@@ -2017,19 +2014,15 @@ Deployment closed and wallet cleaned up.
 
     def get_lease_logs(self, follow=False, tail_lines=100):
         """Get lease logs"""
-        # Ensure wallet is available (restore_wallet is idempotent - returns quickly if already loaded)
-        if not self.restore_wallet():
-            return {'success': False, 'error': 'Wallet restoration failed'}
+        # Use helper to restore wallet and get deployment
+        success, deployment_info, error_response = self._ensure_wallet_and_deployment()
+        if not success:
+            return error_response if error_response else {'success': False, 'error': 'Unknown error'}
         
-        # Check for active deployment (this will query blockchain if needed)
-        has_active, deployment_info = self.has_active_deployment()
-        if not has_active or not deployment_info:
-            return {'success': False, 'error': 'No active deployment found'}
-        
-        dseq = deployment_info.get('dseq')
-        provider = deployment_info.get('provider', '')
-        gseq = deployment_info.get('gseq', '1')
-        oseq = deployment_info.get('oseq', '1')
+        dseq = deployment_info.get('dseq') if deployment_info else None
+        provider = deployment_info.get('provider', '') if deployment_info else ''
+        gseq = deployment_info.get('gseq', '1') if deployment_info else '1'
+        oseq = deployment_info.get('oseq', '1') if deployment_info else '1'
         
         if not dseq or not provider:
             return {'success': False, 'error': 'No active deployment found'}
@@ -2052,19 +2045,15 @@ Deployment closed and wallet cleaned up.
 
     def get_interactive_shell(self, service_name='comfyui'):
         """Get interactive shell into the container"""
-        # Ensure wallet is available (restore_wallet is idempotent - returns quickly if already loaded)
-        if not self.restore_wallet():
-            return {'success': False, 'error': 'Wallet restoration failed'}
-        
-        # Check for active deployment (this will query blockchain if needed)
-        has_active, deployment_info = self.has_active_deployment()
-        if not has_active or not deployment_info:
-            return {'success': False, 'error': 'No active deployment found'}
+        # Use helper to restore wallet and get deployment
+        success, deployment_info, error_response = self._ensure_wallet_and_deployment()
+        if not success:
+            return error_response if error_response else {'success': False, 'error': 'Unknown error'}
 
-        dseq = deployment_info.get('dseq')
-        provider = deployment_info.get('provider')
-        gseq = deployment_info.get('gseq', '1')
-        oseq = deployment_info.get('oseq', '1')
+        dseq = deployment_info.get('dseq') if deployment_info else None
+        provider = deployment_info.get('provider') if deployment_info else None
+        gseq = deployment_info.get('gseq', '1') if deployment_info else '1'
+        oseq = deployment_info.get('oseq', '1') if deployment_info else '1'
 
         if not dseq or not provider:
             return {'success': False, 'error': 'Missing deployment info'}
