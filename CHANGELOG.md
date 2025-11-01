@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.6] - 2025-11-01
+
 ### Changed
 - **Akash Mainnet 14 compatibility**: Updated script for Akash Network Mainnet 14 upgrade
   - Verified compatibility with provider-services v0.10.1 (upgraded from v0.8.4)
