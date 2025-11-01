@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Akash Mainnet 14 compatibility**: Updated script for Akash Network Mainnet 14 upgrade
+  - Verified compatibility with provider-services v0.10.1 (upgraded from v0.8.4)
+  - Provider-services v0.10.1 uses new chain SDK and Akash v1 blockchain architecture
+  - Updated event parsing to handle new `akash.deployment.v1.EventDeploymentCreated` event structure
+  - All RPC nodes tested and confirmed working with new mainnet version
+  - Script now fully compatible with Mainnet 14 network changes (October 2025)
+
+### Fixed
+- **Code structure**: 
+  - Corrected Python file structure: shebang → docstring → imports → functions → classes
+  - Fixed PEP 8 compliance: separated multi-import statements onto individual lines
+  - Alphabetically sorted imports for better maintainability
+
+- **DSEQ parsing bug**: Fixed critical bug where block height was used instead of deployment DSEQ
+  - Script was incorrectly parsing `height` field (23989108) instead of actual DSEQ (23989107)
+  - Enhanced `_parse_dseq_from_output()` to extract DSEQ from `EventDeploymentCreated` event
+  - Removed fallback text parsing - only JSON responses are now used for DSEQ extraction
+  - Deployment now correctly tracks the actual deployment, not an off-by-one error
+  - This fix was required due to Mainnet 14's new event structure
+
 ## [1.1.5] - 2025-10-20
 
 ### Fixed

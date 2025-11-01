@@ -25,18 +25,27 @@ When updating CHANGELOG.md:
 
 # IMPORTANT NOTES - DO NOT FORGET
 
-## ⚠️ CRITICAL: When Running Locally Always Source Environment Variables First !
+## ⚠️ CRITICAL: Environment Variables - Local vs Remote
 
-### Environment Variables
+### Local Development (YOUR MACHINE)
 **ALWAYS source the test-env-vars.sh file before running commands:**
 
 ```bash
 source test-env-vars.sh
 ```
 
+### Remote Production (IWBDPP CONTAINER)
+**DO NOT source test-env-vars.sh on remote - it doesn't exist there!**
+
+Environment variables are **already configured** in the container environment:
+- `COMPOSE_PROJECT_NAME=tdk` (for wallet naming)
+- `IWB_*` variables (mail, domain, Storj credentials, etc.)
+- n8n workflow passes script and SDL as temporary files
+- Container environment is persistent and ready to use
+
 ## Running Commands
 
-### Local Testing
+### Local Testing (Development Machine)
 **CORRECT way to run the script locally:**
 ```bash
 source test-env-vars.sh && python3 iwb-akash-deploy.py -f test.yml
@@ -57,16 +66,24 @@ source test-env-vars.sh && python3 iwb-akash-deploy.py -f test.yml --dry-run
 source test-env-vars.sh && python3 iwb-akash-deploy.py -f test.yml --debug
 ```
 
-**WRONG ways (DO NOT USE):**
+**WRONG ways (DO NOT USE on local machine):**
 - ❌ `python3 iwb-akash-deploy.py -f test.yml` (without sourcing env vars first)
 - ❌ `export COMPOSE_PROJECT_NAME=tdk && python3 ...` (export doesn't persist to Python subprocess)
 
 ### Remote Server Testing
-**SSH to remote server and execute commands in container:**
+**SSH to remote server and execute commands in container.**
+
+**IMPORTANT:** Environment variables are already set in the container - DO NOT source test-env-vars.sh!
 
 ```bash
 # Basic SSH connection
 ssh iwb001
+
+# Check provider-services version
+ssh iwb001 'sudo docker exec -u n8n tdk-iwbdpp-1 provider-services version'
+
+# Test RPC connectivity
+ssh iwb001 'sudo docker exec -u n8n tdk-iwbdpp-1 provider-services query block --node https://rpc.akashnet.net:443 2>&1 | head -15'
 
 # Check recent deployment logs
 ssh iwb001 'sudo docker exec -u n8n tdk-iwbdpp-1 bash -c "ls -lht /home/n8n/iwb-akash-deploy*.log | head -3"'

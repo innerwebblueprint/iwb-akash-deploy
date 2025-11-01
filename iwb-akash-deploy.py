@@ -6,11 +6,26 @@ Deploy ComfyUI instances to Akash Network for n8n workflows
 
 __version__ = "1.1.5"
 
-import os, sys, json, subprocess, time, secrets, string, argparse, requests, concurrent.futures
-import stat, shutil, traceback, logging, yaml, tempfile
+import argparse
+import concurrent.futures
+import json
+import logging
+import os
+import secrets
+import shutil
+import stat
+import string
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+import yaml
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Tuple, List, Any
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 
 # Configuration
 compose_project = os.getenv('COMPOSE_PROJECT_NAME')
@@ -34,6 +49,31 @@ AKASH_RPC_NODES = [
 AKASH_NODE_FALLBACK = 'https://rpc.akashnet.net:443'
 COMFYUI_PORT = 8188
 DEFAULT_GAS_CONFIG = {'gas': 'auto', 'gas_adjustment': '1.75', 'gas_prices': '0.025uakt'}
+
+
+def strip_cli_warnings(output):
+    """
+    Remove known CLI warning lines from Akash CLI output before parsing as JSON or YAML.
+    Returns only the lines that are likely to be valid JSON/YAML.
+    """
+    warning_prefixes = [
+        'Warning:',
+        'I[',  # Tendermint info log lines
+        'E[',  # Tendermint error log lines
+        'minimum-gas-prices is not set',
+        'DEPRECATED:',
+        'WRN ',
+        'Error: ',
+    ]
+    clean_lines = []
+    for line in output.splitlines():
+        if any(line.strip().startswith(prefix) for prefix in warning_prefixes):
+            continue
+        if not line.strip():
+            continue
+        clean_lines.append(line)
+    return '\n'.join(clean_lines)
+
 
 class AkashDeployer:
     """Main deployer class - compact version"""
@@ -268,11 +308,11 @@ class AkashDeployer:
     def build_akash_command(self, args, needs_gas=False, use_mtls=False, extra_flags=None, needs_keyring=True):
         """Build provider-services command"""
         cmd = ['provider-services'] + args
-        
+
         # Add RPC node for all commands that need blockchain connection
         if any(x in args for x in ['query', 'tx']) or needs_gas:
             cmd.extend(['--node', self.akash_node])
-            
+
         if needs_keyring:
             cmd.extend(['--keyring-backend', AKASH_KEYRING_BACKEND])
         if needs_gas or ('lease-status' in args):
@@ -325,16 +365,14 @@ class AkashDeployer:
                         self.akash_node = original_node
         
         if returncode == 0:
+            cleaned = strip_cli_warnings(stdout)
             try:
-                # Try JSON first
-                return True, json.loads(stdout)
+                return True, json.loads(cleaned)
             except json.JSONDecodeError:
                 try:
-                    # Try YAML if JSON fails
-                    return True, yaml.safe_load(stdout)
+                    return True, yaml.safe_load(cleaned)
                 except yaml.YAMLError:
-                    # Return raw string if both fail
-                    return True, stdout
+                    return True, cleaned
         return False, stderr
 
     def restore_wallet(self):
@@ -658,22 +696,43 @@ class AkashDeployer:
         
         # Query certificates for this wallet on-chain
         success, result = self.execute_query(['query', 'cert', 'list', '--owner', self.wallet_address])
-        
-        # Check if certificate exists on-chain (result must be dict with certificates)
-        if success and isinstance(result, dict) and result.get('certificates'):
-            cert_count = len(result.get('certificates', []))
-            self.logger.info(f"✅ Certificate already published ({cert_count} certificate(s) found for this wallet)")
-            
+
+        # Akash Mainnet 14/provider-services v0.10.1: output may be dict with 'certificates', or a list, or other structure
+        certs = []
+        if success:
+            if isinstance(result, dict):
+                # New format: {'certificates': [ { certificate: {...}, state: 'valid', ... }, ... ]}
+                if 'certificates' in result and isinstance(result['certificates'], list):
+                    certs = result['certificates']
+                # Some versions may return a single certificate as dict
+                elif 'certificate' in result:
+                    certs = [result]
+            elif isinstance(result, list):
+                certs = result
+
+        # Find at least one valid certificate
+        valid_certs = []
+        for c in certs:
+            # v0.10.1: each entry is { certificate: {...}, state: 'valid', ... }
+            state = c.get('state')
+            if not state and 'certificate' in c and isinstance(c['certificate'], dict):
+                state = c.get('state') or c['certificate'].get('state')
+            if state == 'valid':
+                valid_certs.append(c)
+
+        if valid_certs:
+            self.logger.info(f"✅ Certificate already published ({len(valid_certs)} valid certificate(s) found for this wallet)")
+
             # If on-chain certificate exists but local file is missing, regenerate it
             if not local_cert_exists:
                 # In dry-run mode, just report what would happen
                 if self.is_dry_run:
                     self.logger.info("🧪 DRY-RUN: Would regenerate local certificate files during actual deployment")
                     return True
-                
+
                 self.logger.info("   Local certificate files missing, regenerating...")
                 os.makedirs(cert_dir, exist_ok=True)
-                
+
                 # Generate local certificate files (this creates .pem and .crt files)
                 # Note: This won't publish a new cert since one already exists on-chain
                 success, stdout, stderr = self.execute_tx(['tx', 'cert', 'generate', 'client'])
@@ -925,41 +984,50 @@ class AkashDeployer:
         """Parse DSEQ from deployment creation output - tries JSON then text patterns"""
         import re
         dseq = None
-        
-        # Try JSON parsing first
         try:
-            output_data = json.loads(stdout)
+            output_data = json.loads(strip_cli_warnings(stdout))
             if isinstance(output_data, dict):
                 if output_data.get('txhash'):
                     self.logger.info(f"Got transaction hash: {output_data['txhash']}")
-                
-                # Extract from transaction logs/events
-                for log in output_data.get('logs', []):
-                    for event in log.get('events', []):
-                        if event.get('type') == 'akash.v1':
-                            for attr in event.get('attributes', []):
-                                if attr.get('key') == 'dseq' and attr.get('value'):
-                                    return attr['value']
-                
-                # Try raw_log field
+
+                # 1. Look for EventDeploymentCreated event
+                events = output_data.get('events', [])
+                for event in events:
+                    if event.get('type') == 'akash.deployment.v1.EventDeploymentCreated':
+                        for attr in event.get('attributes', []):
+                            if attr.get('key') == 'id' and attr.get('value'):
+                                # Value is a JSON string: {"owner":"...","dseq":"23989107"}
+                                try:
+                                    id_obj = json.loads(attr['value'])
+                                    dseq_val = id_obj.get('dseq')
+                                    if dseq_val:
+                                        self.logger.debug(f"Parsed dseq from EventDeploymentCreated: {dseq_val}")
+                                        return dseq_val
+                                except Exception as e:
+                                    self.logger.debug(f"Failed to parse dseq from id attribute: {e}")
+
+                # 2. Try raw_log field for dseq
                 if raw_log := output_data.get('raw_log', ''):
                     if match := re.search(r'"dseq":"(\d+)"', raw_log):
+                        self.logger.debug(f"Parsed dseq from raw_log: {match.group(1)}")
                         return match.group(1)
+
+                # 3. Fallback: scan for dseq in logs/events (legacy)
+                for log in output_data.get('logs', []):
+                    for event in log.get('events', []):
+                        for attr in event.get('attributes', []):
+                            if attr.get('key') == 'dseq' and attr.get('value'):
+                                self.logger.debug(f"Parsed dseq from logs/events: {attr['value']}")
+                                return attr['value']
+
+                # 4. BAD: Do NOT use height as dseq
+                if output_data.get('height'):
+                    self.logger.warning(f"Height field present in output, but should NOT be used as dseq: {output_data['height']}")
+
         except (json.JSONDecodeError, Exception) as e:
             self.logger.debug(f"JSON parsing failed: {e}")
-        
-        # Fall back to text parsing - look for 6+ digit numbers in relevant lines
-        for line in stdout.split('\n'):
-            line = line.strip()
-            if any(kw in line.lower() for kw in ['deployment', 'created', 'dseq']):
-                if matches := re.findall(r'\b\d{6,}\b', line):
-                    return matches[0]
-        
-        # Last resort: any 6+ digit number
-        for line in stdout.split('\n'):
-            if matches := re.findall(r'\b\d{6,}\b', line):
-                return matches[0]
-        
+
+        self.logger.error("Failed to parse dseq from deployment output!")
         return None
 
     def _find_recent_deployment(self):
@@ -1315,9 +1383,9 @@ class AkashDeployer:
             manifest = None
             if self.yaml_file:
                 with open(self.yaml_file, 'r') as f:
-                    manifest = yaml.safe_load(f.read())
+                    manifest = yaml.safe_load(strip_cli_warnings(f.read()))
             elif self.yaml_content:
-                manifest = yaml.safe_load(self.yaml_content)
+                manifest = yaml.safe_load(strip_cli_warnings(self.yaml_content))
             else:
                 # Default preferences if no manifest
                 return ['rtx4090', 'a100', 'h100', 'rtx3090', 'rtx3080']
@@ -1447,9 +1515,9 @@ class AkashDeployer:
             try:
                 # Try JSON first, then YAML as fallback
                 try:
-                    status_data = json.loads(stdout) if stdout else {}
+                    status_data = json.loads(strip_cli_warnings(stdout)) if stdout else {}
                 except json.JSONDecodeError:
-                    status_data = yaml.safe_load(stdout) if stdout else {}
+                    status_data = yaml.safe_load(strip_cli_warnings(stdout)) if stdout else {}
                 
                 services = status_data.get('services', {})
                 
@@ -1835,50 +1903,6 @@ Use --check-ready to monitor deployment status.
                 'provider': provider
             }
 
-            # OLD BEHAVIOR (commented out - now use --check-ready instead):
-            # service_url = self.wait_for_ready(dseq, provider)
-            # if not service_url:
-            #     return self._error_response('Service failed to become ready',
-            #                                deployment_info=result.get('deployment_info'),
-            #                                lease_info=lease_result.get('lease_info'))
-            #
-            # # Update deployment state with service URL, API credentials, and status
-            # final_deployment_state = self.load_state()
-            # if final_deployment_state:
-            #     service_url, api_credentials = self._update_deployment_metadata(final_deployment_state, dseq)
-            #     final_deployment_state['status'] = 'ready'
-            #     self.save_state(final_deployment_state)
-            # else:
-            #     api_credentials = self.generate_api_credentials(service_url)
-            #
-            # # Send success notification email
-            # try:
-            #     subject = f"Akash Deployment {dseq} Created Successfully"
-            #     body = f"""ComfyUI Deployment Created
-            #
-            # DSEQ: {dseq}
-            # Provider: {provider}
-            # Service URL: {service_url}--close
-            # Time: {datetime.now(timezone.utc).isoformat()}Z
-            #
-            # API Credentials:
-            # - Username: {api_credentials['username']}
-            # - Password: {api_credentials['password']}
-            #
-            # The deployment is ready to use.
-            # """
-            #     self.send_email(subject, body)
-            # except Exception as e:
-            #     self.logger.warning(f"⚠️ Could not send deployment notification: {e}")
-            #
-            # return {
-            #     'success': True,
-            #     'message': 'ComfyUI deployment successful',
-            #     'deployment_info': result['deployment_info'],
-            #     'lease_info': lease_result['lease_info'],
-            #     'service_url': service_url,
-            #     'api_credentials': api_credentials
-            # }
 
         except Exception as e:
             self.logger.error(f"❌ Deployment failed: {e}")
@@ -1909,7 +1933,7 @@ Use --check-ready to monitor deployment status.
                 
                 try:
                     if stdout:
-                        tx_data = json.loads(stdout)
+                        tx_data = json.loads(strip_cli_warnings(stdout))
                         if tx_data and isinstance(tx_data, dict):
                             fee_info = tx_data.get('tx', {}).get('auth_info', {}).get('fee', {})
                             for amount in fee_info.get('amount', []):
