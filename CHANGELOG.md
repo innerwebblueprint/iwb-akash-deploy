@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Modular bid query system**: Created centralized `_query_bids(dseq, state_filter)` method
+  - Returns categorized bid results: `open_bids`, `closed_bids`, `all_bids`
+  - Supports filtering by state: `'open'`, `'closed'`, or `'all'`
+  - Eliminates code duplication across multiple methods
+  - Used by both `wait_for_bids()` and deployment validation logic
+
+- **Enhanced deployment-without-lease recovery**: Intelligent handling of deployments that exist but have no lease
+  - Automatically queries blockchain for lease info when missing from state
+  - Checks bid status (open/closed/none) to determine appropriate action
+  - Auto-creates lease if open bids are available
+  - Auto-closes deployment if bids expired or deployment is stale (>5 min with no bids)
+  - Distinguishes between "never had bids" vs "had bids that expired"
+  - Prevents duplicate deployments - always checks for existing deployment first
+
+### Changed
+- **Refactored `wait_for_bids()`**: Now uses centralized `_query_bids()` method
+  - Removed duplicate bid query logic
+  - Simplified code structure for better maintainability
+  - Improved debugging output
+
+- **Enhanced `run()` deployment validation**: More robust checking for existing deployments
+  - Always verifies deployment state before creating new one
+  - Checks for lease info in state file and blockchain
+  - Automatic lease creation if deployment exists with open bids
+  - Automatic cleanup of expired/stale deployments
+
+### Fixed
+- **Deployment-without-lease scenarios**: Script now properly handles all edge cases
+  - Scenario 1: Deployment with open bids → Creates lease and sends manifest
+  - Scenario 2: Deployment with only closed bids → Closes deployment (bids expired)
+  - Scenario 3: Deployment >5 min old with no bids → Closes stale deployment
+  - Scenario 4: Deployment <5 min old with no bids → Waits for bids
+  - Clear, actionable error messages for each scenario
+
+- **Code duplication**: Eliminated duplicate bid query logic
+  - Previously had bid queries in both `_query_bids()` and `wait_for_bids()`
+  - Now centralized in single `_query_bids()` method
+
+### Improved
+- **Error messaging**: More informative messages for deployment states
+  - "Deployment had bids but they all expired" - User knows bids came but timed out
+  - "No bids received after 5 minutes" - User knows deployment never attracted bids
+  - "Deployment exists but has no bids yet (age: X min)" - User knows to wait
+  - Includes bid counts in logs: "📊 Bid status: X open, Y closed, Z total"
+
 ## [1.1.7] - 2025-11-01
 
 ## [1.1.6] - 2025-11-01

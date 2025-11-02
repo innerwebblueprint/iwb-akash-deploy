@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 iwb-akash-deploy.py - Compact Akash Deployment Script
-Deploy ComfyUI instances to Akash Network for n8n workflows
+Deploy AI compute instances to Akash Network, specifically designed for use within n8n workflows
 """
 
 __version__ = "1.1.7"
@@ -883,6 +883,60 @@ class AkashDeployer:
             self.logger.warning(f"Error querying lease info for deployment {dseq}: {e}")
             return None
 
+    def _query_bids(self, dseq, state_filter='open'):
+        """Query bids for a deployment
+        
+        Args:
+            dseq: Deployment sequence number
+            state_filter: Filter by bid state ('open', 'closed', 'all')
+                         'open' - only open bids
+                         'closed' - only closed bids  
+                         'all' - all bids regardless of state
+        
+        Returns:
+            dict with 'open_bids', 'closed_bids', and 'all_bids' lists
+            or None if query fails
+        """
+        try:
+            # Query all bids (no state filter)
+            success, result = self.execute_query([
+                'query', 'market', 'bid', 'list', '--dseq', str(dseq), '--owner', self.wallet_address
+            ])
+            
+            if not success or not isinstance(result, dict):
+                # Try with state filter as fallback
+                success, result = self.execute_query([
+                    'query', 'market', 'bid', 'list', 
+                    '--dseq', str(dseq), '--owner', self.wallet_address, '--state', state_filter
+                ])
+                
+                if success and isinstance(result, dict):
+                    bids = result.get('bids', [])
+                    # Assume all returned bids match the state filter
+                    if state_filter == 'open':
+                        return {'open_bids': bids, 'closed_bids': [], 'all_bids': bids}
+                    elif state_filter == 'closed':
+                        return {'open_bids': [], 'closed_bids': bids, 'all_bids': bids}
+                    else:
+                        return {'open_bids': bids, 'closed_bids': [], 'all_bids': bids}
+                
+                return None
+            
+            # Parse and categorize bids
+            all_bids = result.get('bids', [])
+            open_bids = [bid for bid in all_bids if bid.get('bid', {}).get('state') == 'open']
+            closed_bids = [bid for bid in all_bids if bid.get('bid', {}).get('state') == 'closed']
+            
+            return {
+                'open_bids': open_bids,
+                'closed_bids': closed_bids,
+                'all_bids': all_bids
+            }
+            
+        except Exception as e:
+            self.logger.warning(f"Error querying bids for deployment {dseq}: {e}")
+            return None
+
     def has_active_deployment(self):
         """Check for active deployment and validate it's still active"""
         # First check local state file
@@ -1158,47 +1212,26 @@ class AkashDeployer:
         while time.time() - start_time < timeout:
             bid_check_count += 1
             
-            # Use the correct bid query - the command syntax works, timeouts are RPC-node specific
-            success, result = self.execute_query([
-                'query', 'market', 'bid', 'list', 
-                '--dseq', dseq, '--owner', self.wallet_address, '--state', 'open'
-            ])
+            # Use modular bid query method
+            bid_result = self._query_bids(dseq, state_filter='open')
             
-            self.logger.debug(f"Bid check #{bid_check_count}: success={success} (RPC: {self.akash_node})")
+            self.logger.debug(f"Bid check #{bid_check_count} (RPC: {self.akash_node})")
             if self.debug_mode and bid_check_count <= 2:
-                self.logger.debug(f"Raw bid query result: {result}")
+                self.logger.debug(f"Bid query result: {bid_result}")
             
-            if success and isinstance(result, dict):
-                bids = result.get('bids', [])
-                if bids:
-                    self.logger.info(f"✅ Received {len(bids)} open bids for DSEQ {dseq}")
-                    return bids
+            if bid_result:
+                open_bids = bid_result.get('open_bids', [])
+                closed_bids = bid_result.get('closed_bids', [])
+                
+                if open_bids:
+                    self.logger.info(f"✅ Received {len(open_bids)} open bids for DSEQ {dseq}")
+                    return open_bids
+                elif closed_bids:
+                    self.logger.debug(f"Found {len(closed_bids)} closed bids - no open bids")
                 else:
                     self.logger.debug(f"No open bids yet for DSEQ {dseq}")
-            elif success:
-                self.logger.debug(f"Bid query returned non-dict result: {type(result)} - {result}")
             else:
-                self.logger.debug(f"Bid query failed on {self.akash_node}: {result}")
-                
-                # Try a different approach - query without state filter as fallback
-                if bid_check_count % 3 == 0:  # Every 3rd attempt, try different approach
-                    self.logger.debug(f"Trying bid query without state filter as fallback...")
-                    fallback_success, fallback_result = self.execute_query([
-                        'query', 'market', 'bid', 'list', '--dseq', dseq, '--owner', self.wallet_address
-                    ])
-                    
-                    if fallback_success and isinstance(fallback_result, dict):
-                        all_bids = fallback_result.get('bids', [])
-                        open_bids = [bid for bid in all_bids 
-                                   if bid.get('bid', {}).get('state') == 'open']
-                        if open_bids:
-                            self.logger.info(f"✅ Found {len(open_bids)} open bids via fallback query")
-                            return open_bids
-                        elif all_bids:
-                            closed_bids = [bid for bid in all_bids if bid.get('bid', {}).get('state') == 'closed']
-                            self.logger.debug(f"Found {len(all_bids)} total bids ({len(closed_bids)} closed) - no open bids")
-                    else:
-                        self.logger.debug(f"Fallback bid query also failed: {fallback_result}")
+                self.logger.debug(f"Bid query failed on {self.akash_node}")
             
             if bid_check_count % 6 == 0:  # Every minute (6 * 10s = 60s)
                 elapsed = int(time.time() - start_time)
@@ -1492,11 +1525,26 @@ class AkashDeployer:
         # Get provider info from saved state
         deployment_state = self.load_state()
         if not deployment_state or 'provider' not in deployment_state:
-            return {'success': False, 'error': 'No provider information found in deployment state'}
-        
-        provider = deployment_state['provider']
-        gseq = deployment_state.get('gseq', '1')
-        oseq = deployment_state.get('oseq', '1')
+            # Try to fetch provider info from blockchain
+            self.logger.info(f"⚠️  Provider info not in state file, querying blockchain for lease...")
+            lease_info = self._get_lease_info_for_deployment(str(dseq))
+            
+            if not lease_info or 'provider' not in lease_info:
+                return {'success': False, 'error': 'No provider information found in deployment state and no active lease found on blockchain. Deployment may not have been fully created or lease was not established.'}
+            
+            # Update state with lease info
+            self.logger.info(f"✅ Found lease info from blockchain, updating state file")
+            if deployment_state:
+                deployment_state.update(lease_info)
+                self.save_state(deployment_state)
+            
+            provider = lease_info['provider']
+            gseq = lease_info.get('gseq', '1')
+            oseq = lease_info.get('oseq', '1')
+        else:
+            provider = deployment_state['provider']
+            gseq = deployment_state.get('gseq', '1')
+            oseq = deployment_state.get('oseq', '1')
         
         self.logger.info(f"🔍 Checking service status for deployment {dseq}")
         
@@ -1715,11 +1763,13 @@ class AkashDeployer:
             status_result = self.check_service_status(dseq)
             
             if not status_result.get('success'):
+                error_msg = status_result.get('error', 'Unknown error')
+                self.logger.error(f"❌ Service status check failed: {error_msg}")
                 return {
                     'success': True,
                     'ready': False,
                     'status': 'error_checking_status',
-                    'error': 'Failed to check service status',
+                    'error': f'Failed to check service status: {error_msg}',
                     'dseq': dseq
                 }
             
@@ -1793,10 +1843,105 @@ class AkashDeployer:
             if has_active and active_deployment_info:
                 # We have a verified active deployment
                 dseq = active_deployment_info.get('dseq')
-                self.logger.info(f"✅ Using existing active deployment: DSEQ {dseq}")
+                self.logger.info(f"✅ Found existing active deployment: DSEQ {dseq}")
                 
                 # Switch to dseq-specific log file
                 self._switch_to_dseq_log_file(dseq)
+                
+                # Check if deployment has lease info (provider, gseq, oseq)
+                has_lease_info = active_deployment_info.get('provider') and active_deployment_info.get('gseq') and active_deployment_info.get('oseq')
+                
+                if not has_lease_info:
+                    # Deployment exists but no lease - check if lease exists on blockchain
+                    self.logger.warning(f"⚠️  Deployment {dseq} has no lease info in state, checking blockchain...")
+                    lease_info = self._get_lease_info_for_deployment(str(dseq))
+                    
+                    if lease_info and lease_info.get('provider'):
+                        # Lease exists on blockchain, update state
+                        self.logger.info(f"✅ Found lease on blockchain, updating state")
+                        active_deployment_info.update(lease_info)
+                        self.save_state(active_deployment_info)
+                    else:
+                        # No lease on blockchain - check bid status
+                        self.logger.warning(f"⚠️  No lease found for deployment {dseq}, checking bid status...")
+                        
+                        # Check deployment age
+                        deployment_age_minutes = 0
+                        state = self.load_state()
+                        if state:
+                            created_at = state.get('created_at', '')
+                            if created_at:
+                                try:
+                                    created_time = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                                    deployment_age_minutes = (datetime.now(timezone.utc) - created_time).total_seconds() / 60
+                                except Exception as e:
+                                    self.logger.debug(f"Could not parse created_at time: {e}")
+                        
+                        # Query for all bids (open and closed)
+                        bid_result = self._query_bids(dseq, state_filter='all')
+                        
+                        if not bid_result:
+                            # Failed to query bids
+                            self.logger.error(f"❌ Failed to query bids for deployment {dseq}")
+                            return self._error_response('Could not query bid status for existing deployment')
+                        
+                        open_bids = bid_result.get('open_bids', [])
+                        closed_bids = bid_result.get('closed_bids', [])
+                        all_bids = bid_result.get('all_bids', [])
+                        
+                        self.logger.info(f"📊 Bid status: {len(open_bids)} open, {len(closed_bids)} closed, {len(all_bids)} total")
+                        
+                        if open_bids:
+                            # We have open bids - try to create lease
+                            self.logger.info(f"✅ Found {len(open_bids)} open bid(s), attempting to create lease...")
+                            best_bid = self.select_best_bid(open_bids)
+                            lease_result = self.create_lease(dseq, best_bid)
+                            
+                            if lease_result['success']:
+                                self.logger.info(f"✅ Lease created successfully!")
+                                # Update state with lease info
+                                active_deployment_info.update(lease_result['lease_info'])
+                                self.save_state(active_deployment_info)
+                                
+                                # Send manifest
+                                manifest_path = active_deployment_info.get('manifest_path')
+                                if manifest_path:
+                                    manifest_result = self.send_manifest(manifest_path, dseq)
+                                    if not manifest_result['success']:
+                                        self.logger.warning(f"⚠️  Manifest send failed: {manifest_result.get('error')}")
+                                else:
+                                    self.logger.warning(f"⚠️  No manifest path in state, cannot send manifest")
+                            else:
+                                self.logger.error(f"❌ Failed to create lease: {lease_result.get('error')}")
+                                return self._error_response(f"Failed to create lease for existing deployment: {lease_result.get('error')}")
+                        
+                        elif closed_bids and not open_bids:
+                            # Had bids but they all closed/expired - close deployment
+                            self.logger.warning(f"⚠️  Deployment had {len(closed_bids)} bid(s) but all expired. Closing deployment...")
+                            close_result = self.close_deployment(dseq)
+                            if close_result.get('success'):
+                                self.logger.info(f"✅ Closed deployment {dseq} with expired bids")
+                                return self._error_response('Previous deployment had bids but they all expired. Please create a new deployment.')
+                            else:
+                                return self._error_response(f"Deployment has expired bids and failed to close: {close_result.get('error')}")
+                        
+                        elif not all_bids and deployment_age_minutes > 5:
+                            # Never had any bids and deployment is old (>5 min) - close it
+                            self.logger.warning(f"⚠️  No bids received after {deployment_age_minutes:.1f} minutes. Closing stale deployment...")
+                            close_result = self.close_deployment(dseq)
+                            if close_result.get('success'):
+                                self.logger.info(f"✅ Closed stale deployment {dseq}")
+                                return self._error_response('Previous deployment expired (no bids received). Please create a new deployment.')
+                            else:
+                                return self._error_response(f"Deployment is stale and failed to close: {close_result.get('error')}")
+                        
+                        else:
+                            # No bids yet but deployment is young (<5 min) - wait
+                            self.logger.info(f"⏳ Deployment is {deployment_age_minutes:.1f} minutes old, waiting for bids...")
+                            return self._error_response(f'Deployment exists but has no bids yet (age: {deployment_age_minutes:.1f} min). Wait for bids or close deployment.')
+                
+                # At this point we have a deployment with lease info
+                self.logger.info(f"✅ Using existing deployment with lease: DSEQ {dseq}")
                 
                 # Update metadata (service_url and api_credentials)
                 service_url, api_credentials = self._update_deployment_metadata(active_deployment_info, dseq)
