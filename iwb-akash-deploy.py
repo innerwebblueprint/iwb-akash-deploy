@@ -1222,7 +1222,7 @@ class AkashDeployer:
         
         scored_bids = []
         for bid in bids:
-            provider = bid['bid']['bid_id']['provider']
+            provider = bid['bid']['id']['provider']
             
             # Get provider attributes
             provider_attrs = self._get_provider_attributes(provider)
@@ -1424,9 +1424,9 @@ class AkashDeployer:
 
     def create_lease(self, dseq, bid):
         """Create lease and save provider info"""
-        provider = bid['bid']['bid_id']['provider']
-        gseq = str(bid['bid']['bid_id']['gseq'])
-        oseq = str(bid['bid']['bid_id']['oseq'])
+        provider = bid['bid']['id']['provider']
+        gseq = str(bid['bid']['id']['gseq'])
+        oseq = str(bid['bid']['id']['oseq'])
         
         self.logger.info(f"🤝 Creating lease with provider {provider}")
         
