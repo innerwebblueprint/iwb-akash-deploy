@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.8] - 2025-11-02
+
 ### Added
 - **Modular bid query system**: Created centralized `_query_bids(dseq, state_filter)` method
   - Returns categorized bid results: `open_bids`, `closed_bids`, `all_bids`

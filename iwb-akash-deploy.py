@@ -4,7 +4,7 @@ iwb-akash-deploy.py - Compact Akash Deployment Script
 Deploy AI compute instances to Akash Network, specifically designed for use within n8n workflows
 """
 
-__version__ = "1.1.7"
+__version__ = "1.1.8"
 
 import argparse
 import concurrent.futures
