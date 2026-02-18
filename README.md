@@ -67,14 +67,49 @@ options:
   -h, --help            show this help message and exit
   --debug               Enable debug mode
   --dry-run             Validate without deploying
+  --check-ready         Check if deployment is ready (services + models)
   --close               Close active deployment
   --status              Check lease status
   --logs                View deployment logs
   --shell               Get interactive shell into container
   --rpc-info            Show RPC info
+  --cert-query          Query certificate status for wallet or --cert-owner
+                        address
+  --cert-add            Ensure certificate exists (generate/publish if
+                        missing)
+  --cert-new            Create and publish a new certificate
+  --cert-overwrite      With --cert-new: revoke existing valid cert(s) before
+                        publishing new one
+  --cert-revoke-serial CERT_REVOKE_SERIAL
+                        Revoke a specific certificate serial
+  --cert-owner CERT_OWNER
+                        Wallet address owner for --cert-query (defaults to
+                        restored wallet address)
   -y YAML, --yaml YAML  Custom YAML manifest
   -f YAML_FILE, --yaml-file YAML_FILE
                         Path to YAML file
+```
+
+### Certificate Management
+
+```bash
+# Query certs for restored wallet
+source test-env-vars.sh && python3 iwb-akash-deploy.py --cert-query
+
+# Query certs for specific owner address
+source test-env-vars.sh && python3 iwb-akash-deploy.py --cert-query --cert-owner akash1...
+
+# Ensure cert exists (idempotent; creates/publishes only when missing)
+source test-env-vars.sh && python3 iwb-akash-deploy.py --cert-add
+
+# Create and publish a brand new cert (fails if valid cert already exists)
+source test-env-vars.sh && python3 iwb-akash-deploy.py --cert-new
+
+# Replace existing valid cert(s): revoke existing then publish new
+source test-env-vars.sh && python3 iwb-akash-deploy.py --cert-new --cert-overwrite
+
+# Revoke one cert by serial
+source test-env-vars.sh && python3 iwb-akash-deploy.py --cert-revoke-serial <serial>
 ```
 
 ## Development

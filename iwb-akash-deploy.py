@@ -735,7 +735,7 @@ class AkashDeployer:
 
                 # Generate local certificate files (this creates .pem and .crt files)
                 # Note: This won't publish a new cert since one already exists on-chain
-                success, stdout, stderr = self.execute_tx(['tx', 'cert', 'generate', 'client'])
+                success, stdout, stderr = self.execute_tx(['tx', 'cert', 'generate', 'client', '--overwrite'])
                 if success:
                     self.logger.info("✅ Local certificate files regenerated successfully")
                     return True
@@ -755,7 +755,7 @@ class AkashDeployer:
         os.makedirs(cert_dir, exist_ok=True)
         
         # First generate local certificate files
-        success, stdout, stderr = self.execute_tx(['tx', 'cert', 'generate', 'client'])
+        success, stdout, stderr = self.execute_tx(['tx', 'cert', 'generate', 'client', '--overwrite'])
         if not success:
             self.logger.error(f"❌ Certificate generation failed: {stderr}")
             return False
@@ -775,6 +775,182 @@ class AkashDeployer:
             # Don't fail the whole process if backup fails
         
         return True
+
+    def _parse_certificate_entries(self, query_result):
+        """Normalize certificate query output into a list of entries"""
+        certs = []
+        if isinstance(query_result, dict):
+            if 'certificates' in query_result and isinstance(query_result['certificates'], list):
+                certs = query_result['certificates']
+            elif 'certificate' in query_result:
+                certs = [query_result]
+        elif isinstance(query_result, list):
+            certs = query_result
+
+        normalized = []
+        for cert_entry in certs:
+            if not isinstance(cert_entry, dict):
+                continue
+
+            cert_data_raw = cert_entry.get('certificate')
+            cert_data = cert_data_raw if isinstance(cert_data_raw, dict) else cert_entry
+            if not isinstance(cert_data, dict):
+                cert_data = {}
+
+            state = cert_entry.get('state') or cert_data.get('state') or 'unknown'
+            serial = cert_entry.get('serial') or cert_data.get('serial')
+            owner = cert_data.get('owner') or cert_entry.get('owner') or self.wallet_address
+
+            normalized.append({
+                'state': state,
+                'serial': serial,
+                'owner': owner,
+                'certificate': cert_data,
+                'raw': cert_entry,
+            })
+
+        return normalized
+
+    def get_certificate_status(self, owner_address=None):
+        """Get on-chain and local certificate status for an owner"""
+        owner = owner_address or self.wallet_address
+        if not owner:
+            return {
+                'success': False,
+                'error': 'Owner wallet address not available',
+                'owner': None,
+                'certificates': []
+            }
+
+        success, result = self.execute_query(['query', 'cert', 'list', '--owner', owner])
+        if not success:
+            return {
+                'success': False,
+                'error': f'Certificate query failed: {result}',
+                'owner': owner,
+                'certificates': []
+            }
+
+        certificates = self._parse_certificate_entries(result)
+        valid_certificates = [c for c in certificates if c.get('state') == 'valid']
+
+        local_certificate_exists = False
+        if owner == self.wallet_address and self.wallet_address:
+            home_dir = os.path.expanduser("~")
+            pem_file = os.path.join(home_dir, ".akash", f"{self.wallet_address}.pem")
+            local_certificate_exists = os.path.exists(pem_file)
+
+        return {
+            'success': True,
+            'owner': owner,
+            'certificate_count': len(certificates),
+            'valid_certificate_count': len(valid_certificates),
+            'has_valid_certificate': len(valid_certificates) > 0,
+            'local_certificate_exists': local_certificate_exists,
+            'certificates': certificates,
+        }
+
+    def query_certificates(self, owner_address=None):
+        """Query certificates for owner (wallet owner by default)"""
+        status = self.get_certificate_status(owner_address=owner_address)
+        if status.get('success'):
+            self.logger.info(
+                f"✅ Certificate query complete: {status['valid_certificate_count']}/{status['certificate_count']} valid for {status['owner']}"
+            )
+        else:
+            self.logger.error(f"❌ Certificate query failed: {status.get('error')}")
+        return status
+
+    def add_certificate(self):
+        """Ensure certificate exists (idempotent) using existing setup flow"""
+        cert_ready = self.setup_certificate()
+        status = self.get_certificate_status(owner_address=self.wallet_address)
+        return {
+            'success': cert_ready,
+            'message': 'Certificate is ready' if cert_ready else 'Certificate setup failed',
+            'certificate_status': status
+        }
+
+    def revoke_certificate(self, serial):
+        """Revoke a specific certificate serial"""
+        if not serial:
+            return {'success': False, 'error': 'Certificate serial is required for revoke'}
+
+        self.logger.info(f"🗑️  Revoking certificate serial: {serial}")
+        success, stdout, stderr = self.execute_tx(['tx', 'cert', 'revoke', 'client', '--serial', str(serial)])
+        if not success:
+            self.logger.error(f"❌ Certificate revoke failed: {stderr}")
+            return {'success': False, 'error': f'Certificate revoke failed: {stderr}', 'serial': serial}
+
+        self.logger.info("✅ Certificate revoked successfully")
+        return {
+            'success': True,
+            'serial': serial,
+            'tx_result': stdout,
+            'certificate_status': self.get_certificate_status(owner_address=self.wallet_address)
+        }
+
+    def create_new_certificate(self, overwrite=False):
+        """Create and publish a new certificate, optionally replacing existing valid certs"""
+        self.logger.info("🔐 Creating new certificate...")
+
+        current_status = self.get_certificate_status(owner_address=self.wallet_address)
+        if not current_status.get('success'):
+            return current_status
+
+        valid_certs = [c for c in current_status.get('certificates', []) if c.get('state') == 'valid']
+        if valid_certs and not overwrite:
+            message = 'Valid certificate already exists. Use --cert-overwrite with --cert-new to replace it.'
+            self.logger.warning(f"⚠️  {message}")
+            return {
+                'success': False,
+                'error': message,
+                'certificate_status': current_status
+            }
+
+        if overwrite and valid_certs:
+            self.logger.info(f"🔁 Overwrite enabled: revoking {len(valid_certs)} valid certificate(s) first...")
+            for cert in valid_certs:
+                serial = cert.get('serial')
+                if not serial:
+                    error = 'Cannot overwrite certificate because serial was not found in query response'
+                    self.logger.error(f"❌ {error}")
+                    return {
+                        'success': False,
+                        'error': error,
+                        'certificate_status': current_status
+                    }
+
+                revoke_result = self.revoke_certificate(serial)
+                if not revoke_result.get('success'):
+                    return revoke_result
+
+        home_dir = os.path.expanduser("~")
+        cert_dir = os.path.join(home_dir, ".akash")
+        os.makedirs(cert_dir, exist_ok=True)
+
+        generate_cmd = ['tx', 'cert', 'generate', 'client', '--overwrite']
+        success, stdout, stderr = self.execute_tx(generate_cmd)
+        if not success:
+            self.logger.error(f"❌ Certificate generation failed: {stderr}")
+            return {'success': False, 'error': f'Certificate generation failed: {stderr}'}
+
+        success, stdout, stderr = self.execute_tx(['tx', 'cert', 'publish', 'client'])
+        if not success:
+            self.logger.error(f"❌ Certificate publication failed: {stderr}")
+            return {'success': False, 'error': f'Certificate publication failed: {stderr}'}
+
+        backup_uploaded = self.create_wallet_backup()
+        if not backup_uploaded:
+            self.logger.warning("⚠️  New certificate published but wallet backup update failed")
+
+        updated_status = self.get_certificate_status(owner_address=self.wallet_address)
+        return {
+            'success': True,
+            'message': 'New certificate created and published successfully',
+            'backup_uploaded': backup_uploaded,
+            'certificate_status': updated_status
+        }
 
     def create_deployment_manifest(self, api_credentials):
         """Return path to manifest file - use provided file from n8n or yaml content directly"""
@@ -1772,6 +1948,35 @@ class AkashDeployer:
                     'error': f'Failed to check service status: {error_msg}',
                     'dseq': dseq
                 }
+
+            # Update service_url/api_url as soon as provider exposes URIs,
+            # even if models are still downloading
+            service_uris = status_result.get('service_uris', {})
+            service_url = None
+            for _, uris in service_uris.items():
+                if uris and len(uris) > 0:
+                    service_url = f"https://{uris[0]}"
+                    break
+
+            if service_url and deployment_info:
+                updated = False
+                if deployment_info.get('service_url') != service_url:
+                    deployment_info['service_url'] = service_url
+                    updated = True
+
+                api_credentials = deployment_info.get('api_credentials', {})
+                if not api_credentials:
+                    api_credentials = self.generate_api_credentials(service_url)
+                    deployment_info['api_credentials'] = api_credentials
+                    updated = True
+                elif api_credentials.get('api_url') == 'http://service-url-placeholder' or not api_credentials.get('api_url'):
+                    api_credentials['api_url'] = service_url
+                    deployment_info['api_credentials'] = api_credentials
+                    updated = True
+
+                if updated:
+                    self.save_state(deployment_info)
+                    self.logger.info(f"🔄 Updated deployment metadata early with service URL: {service_url}")
             
             all_ready = status_result.get('all_ready', False)
             
@@ -2006,11 +2211,18 @@ class AkashDeployer:
             
             # Generate placeholder credentials (will be updated when ready)
             api_credentials = self.generate_api_credentials()
+
+            # Try to get service URL early (may or may not be available yet)
+            early_service_url = self.get_service_url_from_lease(dseq)
+            if early_service_url:
+                api_credentials['api_url'] = early_service_url
             
             # Save to state with 'starting' status
             final_deployment_state = self.load_state()
             if final_deployment_state:
                 final_deployment_state['api_credentials'] = api_credentials
+                if early_service_url:
+                    final_deployment_state['service_url'] = early_service_url
                 final_deployment_state['status'] = 'starting'
                 self.save_state(final_deployment_state)
             
@@ -2023,10 +2235,12 @@ DSEQ: {dseq}
 Provider: {provider}
 Status: Starting (services launching in background)
 Time: {datetime.now(timezone.utc).isoformat()}Z
+Service URL: {early_service_url if early_service_url else 'Pending - use --check-ready to get URL when available'}
 
 API Credentials:
 - Username: {api_credentials['username']}
 - Password: {api_credentials['password']}
+- API URL: {api_credentials['api_url']}
 
 The deployment is starting. Services will be available once fully initialized.
 Use --check-ready to monitor deployment status.
@@ -2352,13 +2566,30 @@ def main():
     parser.add_argument('--logs', action='store_true', help='View deployment logs')
     parser.add_argument('--shell', action='store_true', help='Get interactive shell into container')
     parser.add_argument('--rpc-info', action='store_true', help='Show RPC info')
+    parser.add_argument('--cert-query', action='store_true', help='Query certificate status for wallet or --cert-owner address')
+    parser.add_argument('--cert-add', action='store_true', help='Ensure certificate exists (generate/publish if missing)')
+    parser.add_argument('--cert-new', action='store_true', help='Create and publish a new certificate')
+    parser.add_argument('--cert-overwrite', action='store_true', help='With --cert-new: revoke existing valid cert(s) before publishing new one')
+    parser.add_argument('--cert-revoke-serial', help='Revoke a specific certificate serial')
+    parser.add_argument('--cert-owner', help='Wallet address owner for --cert-query (defaults to restored wallet address)')
     parser.add_argument('-y', '--yaml', help='Custom YAML manifest')
     parser.add_argument('-f', '--yaml-file', help='Path to YAML file')
 
     args = parser.parse_args()
 
     # Determine which actions don't require YAML
-    query_actions = [args.rpc_info, args.check_ready, args.close, args.status, args.logs, args.shell]
+    query_actions = [
+        args.rpc_info,
+        args.check_ready,
+        args.close,
+        args.status,
+        args.logs,
+        args.shell,
+        args.cert_query,
+        args.cert_add,
+        args.cert_new,
+        bool(args.cert_revoke_serial)
+    ]
     deployment_actions = [args.dry_run, (not any(query_actions))]  # dry-run or production deploy
     
     has_query_action = any(query_actions)
@@ -2388,6 +2619,26 @@ def main():
         
         if args.rpc_info:
             result = {'selected_node': deployer.akash_node, 'available_nodes': AKASH_RPC_NODES}
+        elif args.cert_query:
+            if not args.cert_owner and not deployer.restore_wallet():
+                result = {'success': False, 'error': 'Wallet restoration failed'}
+            else:
+                result = deployer.query_certificates(owner_address=args.cert_owner)
+        elif args.cert_add:
+            if not deployer.restore_wallet():
+                result = {'success': False, 'error': 'Wallet restoration failed'}
+            else:
+                result = deployer.add_certificate()
+        elif args.cert_new:
+            if not deployer.restore_wallet():
+                result = {'success': False, 'error': 'Wallet restoration failed'}
+            else:
+                result = deployer.create_new_certificate(overwrite=args.cert_overwrite)
+        elif args.cert_revoke_serial:
+            if not deployer.restore_wallet():
+                result = {'success': False, 'error': 'Wallet restoration failed'}
+            else:
+                result = deployer.revoke_certificate(args.cert_revoke_serial)
         elif args.dry_run:
             result = deployer.dry_run()
         elif args.check_ready:

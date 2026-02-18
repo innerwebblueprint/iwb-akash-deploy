@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Certificate management CLI actions**:
+  - `--cert-query` to query certificate status for wallet or `--cert-owner`
+  - `--cert-add` to ensure certificate exists (idempotent)
+  - `--cert-new` to create and publish a new certificate
+  - `--cert-overwrite` to revoke valid cert(s) before publishing new one
+  - `--cert-revoke-serial` to revoke by serial
+- **Certificate status normalization** via `_parse_certificate_entries()` and `get_certificate_status()` for consistent JSON output across provider-services versions
+- **Backup result visibility**: `--cert-new` now returns `backup_uploaded` so n8n can verify backup upload outcome directly
+
+### Changed
+- **Early metadata persistence**: `check_ready()` now updates and saves `service_url` and `api_credentials.api_url` as soon as lease URIs appear (before full model readiness)
+- **Deployment started email enhancement**: includes `Service URL` when available and always includes `API URL` with a clear pending message when URI is not yet available
+- **Certificate generation robustness**: certificate generation now uses `--overwrite` to avoid local cert-file collisions during regeneration/rotation
+- **README updates**: added certificate management command documentation and examples
+
+### Fixed
+- **Certificate revoke command syntax**: corrected to `tx cert revoke client --serial ...` (required by provider-services)
+
 ## [1.1.8] - 2025-11-02
 
 ### Added
