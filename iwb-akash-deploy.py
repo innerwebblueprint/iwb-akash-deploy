@@ -4,7 +4,7 @@ iwb-akash-deploy.py - Compact Akash Deployment Script
 Deploy AI compute instances to Akash Network, specifically designed for use within n8n workflows
 """
 
-__version__ = "1.1.8"
+__version__ = "1.1.9"
 
 import argparse
 import concurrent.futures
@@ -49,6 +49,9 @@ AKASH_RPC_NODES = [
 AKASH_NODE_FALLBACK = 'https://rpc.akashnet.net:443'
 COMFYUI_PORT = 8188
 DEFAULT_GAS_CONFIG = {'gas': 'auto', 'gas_adjustment': '1.75', 'gas_prices': '0.025uakt'}
+DEFAULT_DEPLOYMENT_DEPOSIT_UACT = int(os.getenv('IWB_DEPLOYMENT_DEPOSIT_UACT', '5000000'))
+DEFAULT_ACT_TOPUP_USD = float(os.getenv('IWB_ACT_TOPUP_USD', '2.0'))
+DEFAULT_AKT_GAS_RESERVE_UAKT = int(os.getenv('IWB_AKT_GAS_RESERVE_UAKT', '500000'))
 
 
 def strip_cli_warnings(output):
@@ -87,9 +90,15 @@ class AkashDeployer:
         self.wallet_address = None
         self.wallet_mnemonic = None
         self.balance_uakt = 0
+        self.balance_uact = 0
+        self.last_act_conversion = {
+            'conversion_performed': False,
+            'message': 'No ACT conversion performed'
+        }
         self.akash_node = None  # Will be set after logger initialization
         self.logger = self._setup_logging()  # Will use self.dseq if provided
         self.state_file = self._get_state_file()
+        self._temp_manifest_files = []
         # Now select RPC node with proper logging
         self.akash_node = self._select_fastest_rpc_node()
 
@@ -667,17 +676,365 @@ class AkashDeployer:
             balances = result.get('balances', [])
             if self.debug_mode:
                 self.logger.debug(f"Found {len(balances)} balance entries: {balances}")
+            self.balance_uakt = 0
+            self.balance_uact = 0
             for balance in balances:
-                if balance.get('denom') == 'uakt':
-                    amount = int(balance.get('amount', 0))
+                denom = balance.get('denom')
+                amount = int(balance.get('amount', 0))
+                if denom == 'uakt':
                     self.balance_uakt = amount
-                    self.logger.info(f"💰 Balance: {amount / 1000000:.2f} AKT")
-                    return amount
-            # If no uakt balance found, wallet might be empty
-            self.logger.info(f"💰 Balance: 0.00 AKT (no uakt balance found)")
+                elif denom == 'uact':
+                    self.balance_uact = amount
+
+            self.logger.info(f"💰 Balance: {self.balance_uakt / 1000000:.2f} AKT | {self.balance_uact / 1000000:.2f} ACT")
+            return self.balance_uakt
         else:
             self.logger.error(f"Failed to get balance: success={success}, result={result}")
         return 0
+
+    def get_act_balance(self):
+        """Get ACT (uact) balance"""
+        if not self.wallet_address:
+            return 0
+
+        self.get_wallet_balance()
+        return self.balance_uact
+
+    def get_bme_params(self):
+        """Get BME module parameters"""
+        success, result = self.execute_query(['query', 'bme', 'params'])
+        if success and isinstance(result, dict):
+            return result.get('params', {}) if isinstance(result.get('params', {}), dict) else {}
+        return {}
+
+    def get_bme_min_mint_uact(self):
+        """Get minimum ACT mint amount in uact from BME params"""
+        params = self.get_bme_params()
+        min_mint_entries = params.get('min_mint', []) if isinstance(params, dict) else []
+
+        if isinstance(min_mint_entries, list):
+            for entry in min_mint_entries:
+                if isinstance(entry, dict) and entry.get('denom') == 'uact':
+                    try:
+                        return int(entry.get('amount', 0))
+                    except (TypeError, ValueError):
+                        return 0
+        return 0
+
+    def get_bme_mint_spread_bps(self):
+        """Get BME mint spread in basis points"""
+        params = self.get_bme_params()
+        try:
+            return int(params.get('mint_spread_bps', 0)) if isinstance(params, dict) else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _get_bme_ledger_record_for_height(self, owner, height):
+        """Get BME ledger record for an owner at a specific block height"""
+        if not owner or not height:
+            return None
+
+        success, result = self.execute_query([
+            'query', 'bme', 'ledger',
+            '--owner', owner,
+            '--limit', '20',
+            '--reverse'
+        ])
+
+        if not success or not isinstance(result, dict):
+            return None
+
+        records = result.get('records', [])
+        for record in records:
+            record_height = record.get('id', {}).get('height')
+            if str(record_height) == str(height):
+                return record
+
+        return None
+
+    def _extract_minted_uact_from_ledger_record(self, ledger_record):
+        """Extract minted uact amount from an executed BME ledger record"""
+        if not isinstance(ledger_record, dict):
+            return 0
+
+        executed_record = ledger_record.get('executed_record', {})
+        if not isinstance(executed_record, dict):
+            return 0
+
+        minted = executed_record.get('minted', {})
+        if not isinstance(minted, dict):
+            return 0
+
+        minted_coin = minted.get('coin', {})
+        if not isinstance(minted_coin, dict):
+            return 0
+
+        if minted_coin.get('denom') != 'uact':
+            return 0
+
+        try:
+            return int(minted_coin.get('amount', 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _normalize_manifest_for_bme(self, manifest):
+        """Normalize manifest pricing denom to uact for BME-compatible deployments"""
+        changed = False
+        if not isinstance(manifest, dict):
+            return manifest, changed
+
+        profiles = manifest.get('profiles', {})
+        placement = profiles.get('placement', {}) if isinstance(profiles, dict) else {}
+
+        if isinstance(placement, dict):
+            for _, placement_entry in placement.items():
+                if not isinstance(placement_entry, dict):
+                    continue
+                pricing = placement_entry.get('pricing', {})
+                if not isinstance(pricing, dict):
+                    continue
+                for _, service_pricing in pricing.items():
+                    if not isinstance(service_pricing, dict):
+                        continue
+                    if service_pricing.get('denom') == 'uakt':
+                        service_pricing['denom'] = 'uact'
+                        changed = True
+
+        return manifest, changed
+
+    def _write_manifest_temp_file(self, manifest_obj):
+        """Write manifest object to temporary file and return file path"""
+        temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', prefix='iwb-deploy-', delete=False)
+        yaml.safe_dump(manifest_obj, temp_file, default_flow_style=False, sort_keys=False)
+        temp_file.close()
+        self._temp_manifest_files.append(temp_file.name)
+        return temp_file.name
+
+    def ensure_act_for_deployment(self, required_uact=DEFAULT_DEPLOYMENT_DEPOSIT_UACT):
+        """Ensure wallet has enough ACT for deployment deposit by minting from AKT when needed"""
+        self.get_wallet_balance()
+        akt_balance_before = self.balance_uakt
+        act_balance = self.balance_uact
+
+        if act_balance >= required_uact:
+            self.logger.info(f"✅ ACT balance sufficient for deployment: {act_balance / 1000000:.2f} ACT")
+            self.last_act_conversion = {
+                'conversion_performed': False,
+                'required_uact': required_uact,
+                'required_act': required_uact / 1_000_000,
+                'act_balance_before_uact': act_balance,
+                'act_balance_before_act': act_balance / 1_000_000,
+                'akt_balance_before_uakt': akt_balance_before,
+                'akt_balance_before_akt': akt_balance_before / 1_000_000,
+                'message': 'ACT balance already sufficient; no conversion needed'
+            }
+            return True
+
+        deficit_uact = max(required_uact - act_balance, 0)
+        bme_min_mint_uact = self.get_bme_min_mint_uact()
+        mint_spread_bps = self.get_bme_mint_spread_bps()
+        spread_multiplier = max(1 - (mint_spread_bps / 10_000), 0.0001)
+
+        target_mint_uact = max(deficit_uact, int(DEFAULT_ACT_TOPUP_USD * 1_000_000), bme_min_mint_uact)
+        target_mint_usd = target_mint_uact / 1_000_000
+
+        if bme_min_mint_uact > 0 and target_mint_uact == bme_min_mint_uact and deficit_uact < bme_min_mint_uact:
+            self.logger.info(
+                f"ℹ️ BME minimum mint applies: {bme_min_mint_uact / 1000000:.2f} ACT minimum per mint request"
+            )
+
+        akt_price = self.get_akt_price()
+        if akt_price and akt_price > 0:
+            burn_uakt = int((target_mint_usd / (akt_price * spread_multiplier)) * 1_000_000)
+            burn_uakt = max(burn_uakt, 1)
+        else:
+            # Fallback if price lookup fails: burn 2 AKT to mint ACT
+            burn_uakt = 2_000_000
+            self.logger.warning("⚠️ Could not fetch AKT/USD price; falling back to burning 2.0 AKT for ACT top-up")
+
+        available_uakt = self.balance_uakt
+        minimum_needed_uakt = burn_uakt + DEFAULT_AKT_GAS_RESERVE_UAKT
+        if available_uakt < minimum_needed_uakt:
+            self.logger.error(
+                f"❌ Insufficient AKT for ACT mint + gas reserve (need {minimum_needed_uakt / 1000000:.2f} AKT, have {available_uakt / 1000000:.2f} AKT)"
+            )
+            self.last_act_conversion = {
+                'conversion_performed': False,
+                'required_uact': required_uact,
+                'required_act': required_uact / 1_000_000,
+                'act_balance_before_uact': act_balance,
+                'act_balance_before_act': act_balance / 1_000_000,
+                'akt_balance_before_uakt': available_uakt,
+                'akt_balance_before_akt': available_uakt / 1_000_000,
+                'burn_uakt_attempted': burn_uakt,
+                'burn_akt_attempted': burn_uakt / 1_000_000,
+                'message': 'Insufficient AKT for ACT conversion + gas reserve'
+            }
+            return False
+
+        self.logger.info(
+            f"🔄 ACT balance low ({act_balance / 1000000:.2f} ACT), minting ACT by burning {burn_uakt / 1000000:.4f} AKT..."
+        )
+        success, stdout, stderr = self.execute_tx(['tx', 'bme', 'mint-act', f'{burn_uakt}uakt'])
+        if not success:
+            self.logger.error(f"❌ ACT mint failed: {stderr}")
+            self.last_act_conversion = {
+                'conversion_performed': False,
+                'required_uact': required_uact,
+                'required_act': required_uact / 1_000_000,
+                'act_balance_before_uact': act_balance,
+                'act_balance_before_act': act_balance / 1_000_000,
+                'akt_balance_before_uakt': akt_balance_before,
+                'akt_balance_before_akt': akt_balance_before / 1_000_000,
+                'burn_uakt_attempted': burn_uakt,
+                'burn_akt_attempted': burn_uakt / 1_000_000,
+                'message': f'ACT mint failed: {stderr.strip()}'
+            }
+            return False
+
+        tx_hash = None
+        tx_height = None
+        tx_code = None
+        try:
+            tx_result = json.loads(strip_cli_warnings(stdout)) if stdout else {}
+            if isinstance(tx_result, dict):
+                tx_hash = tx_result.get('txhash')
+                tx_height = tx_result.get('height')
+                tx_code = tx_result.get('code')
+        except Exception:
+            tx_result = {}
+
+        if tx_code not in (None, 0):
+            self.logger.error(f"❌ ACT mint tx returned non-zero code: {tx_code}")
+            self.last_act_conversion = {
+                'conversion_performed': False,
+                'required_uact': required_uact,
+                'required_act': required_uact / 1_000_000,
+                'act_balance_before_uact': act_balance,
+                'act_balance_before_act': act_balance / 1_000_000,
+                'akt_balance_before_uakt': akt_balance_before,
+                'akt_balance_before_akt': akt_balance_before / 1_000_000,
+                'burn_uakt_attempted': burn_uakt,
+                'burn_akt_attempted': burn_uakt / 1_000_000,
+                'tx_hash': tx_hash,
+                'tx_height': tx_height,
+                'tx_code': tx_code,
+                'message': f'ACT mint tx failed with code {tx_code}'
+            }
+            return False
+
+        ledger_record = None
+        if tx_height:
+            for attempt in range(1, 6):
+                ledger_record = self._get_bme_ledger_record_for_height(self.wallet_address, tx_height)
+                if ledger_record:
+                    break
+                if attempt < 6:
+                    time.sleep(2)
+
+        if ledger_record and ledger_record.get('status') == 'ledger_record_status_canceled':
+            canceled_record = ledger_record.get('canceled_record', {}) if isinstance(ledger_record, dict) else {}
+            cancel_reason = canceled_record.get('cancel_reason', 'unknown')
+            self.logger.error(
+                f"❌ ACT mint was canceled by BME ledger at height {tx_height}. "
+                f"Reason: {cancel_reason}. txhash: {tx_hash}"
+            )
+            self.last_act_conversion = {
+                'conversion_performed': False,
+                'required_uact': required_uact,
+                'required_act': required_uact / 1_000_000,
+                'act_balance_before_uact': act_balance,
+                'act_balance_before_act': act_balance / 1_000_000,
+                'akt_balance_before_uakt': akt_balance_before,
+                'akt_balance_before_akt': akt_balance_before / 1_000_000,
+                'burn_uakt_attempted': burn_uakt,
+                'burn_akt_attempted': burn_uakt / 1_000_000,
+                'bme_min_mint_uact': bme_min_mint_uact,
+                'bme_min_mint_act': bme_min_mint_uact / 1_000_000,
+                'mint_spread_bps': mint_spread_bps,
+                'target_mint_uact': target_mint_uact,
+                'target_mint_act': target_mint_uact / 1_000_000,
+                'tx_hash': tx_hash,
+                'tx_height': tx_height,
+                'ledger_status': ledger_record.get('status'),
+                'ledger_cancel_reason': cancel_reason,
+                'message': f'ACT mint canceled by BME ledger ({cancel_reason})'
+            }
+            return False
+
+        ledger_status = ledger_record.get('status') if isinstance(ledger_record, dict) else None
+        minted_uact_ledger = 0
+        if ledger_status == 'ledger_record_status_executed':
+            minted_uact_ledger = self._extract_minted_uact_from_ledger_record(ledger_record)
+            if minted_uact_ledger > 0:
+                self.logger.info(f"✅ BME ledger confirms executed mint: {minted_uact_ledger / 1000000:.6f} ACT")
+        elif tx_height and not ledger_record:
+            self.logger.warning(
+                f"⚠️ Could not find BME ledger record at height {tx_height} after retry; falling back to bank balance check"
+            )
+        elif ledger_status and ledger_status != 'ledger_record_status_executed':
+            self.logger.warning(
+                f"⚠️ Unexpected BME ledger status for mint tx at height {tx_height}: {ledger_status}"
+            )
+
+        self.get_wallet_balance()
+        refreshed_act_balance = self.balance_uact
+        akt_balance_after = self.balance_uakt
+        minted_uact_from_balance = max(refreshed_act_balance - act_balance, 0)
+        minted_uact_effective = max(minted_uact_from_balance, minted_uact_ledger)
+        effective_act_balance = max(refreshed_act_balance, act_balance + minted_uact_effective)
+
+        self.last_act_conversion = {
+            'conversion_performed': True,
+            'required_uact': required_uact,
+            'required_act': required_uact / 1_000_000,
+            'act_balance_before_uact': act_balance,
+            'act_balance_before_act': act_balance / 1_000_000,
+            'act_balance_after_uact': refreshed_act_balance,
+            'act_balance_after_act': refreshed_act_balance / 1_000_000,
+            'akt_balance_before_uakt': akt_balance_before,
+            'akt_balance_before_akt': akt_balance_before / 1_000_000,
+            'akt_balance_after_uakt': akt_balance_after,
+            'akt_balance_after_akt': akt_balance_after / 1_000_000,
+            'burned_uakt': burn_uakt,
+            'burned_akt': burn_uakt / 1_000_000,
+            'minted_uact_estimate': minted_uact_effective,
+            'minted_act_estimate': minted_uact_effective / 1_000_000,
+            'minted_uact_from_balance': minted_uact_from_balance,
+            'minted_uact_from_ledger': minted_uact_ledger,
+            'effective_act_balance_uact': effective_act_balance,
+            'effective_act_balance_act': effective_act_balance / 1_000_000,
+            'bme_min_mint_uact': bme_min_mint_uact,
+            'bme_min_mint_act': bme_min_mint_uact / 1_000_000,
+            'mint_spread_bps': mint_spread_bps,
+            'target_mint_uact': target_mint_uact,
+            'target_mint_act': target_mint_uact / 1_000_000,
+            'tx_hash': tx_hash,
+            'tx_height': tx_height,
+            'tx_code': tx_code,
+            'ledger_status': ledger_status,
+            'message': 'ACT conversion successful'
+        }
+
+        if effective_act_balance < required_uact:
+            self.logger.error(
+                f"❌ ACT still insufficient after mint (required {required_uact / 1000000:.2f} ACT, "
+                f"effective {effective_act_balance / 1000000:.2f} ACT, bank-visible {refreshed_act_balance / 1000000:.2f} ACT)"
+            )
+            self.last_act_conversion['message'] = 'ACT conversion completed but balance still insufficient'
+            return False
+
+        if refreshed_act_balance < required_uact and effective_act_balance >= required_uact:
+            self.logger.warning(
+                f"⚠️ ACT appears sufficient via BME ledger execution ({effective_act_balance / 1000000:.2f} ACT), "
+                f"but bank query currently shows {refreshed_act_balance / 1000000:.2f} ACT"
+            )
+
+        self.logger.info(
+            f"✅ ACT mint successful. Effective ACT balance: {effective_act_balance / 1000000:.2f} ACT "
+            f"(bank-visible: {refreshed_act_balance / 1000000:.2f} ACT)"
+        )
+        return True
 
     def setup_certificate(self):
         """Setup certificate - ensure both on-chain and local certificate files exist"""
@@ -954,15 +1311,42 @@ class AkashDeployer:
 
     def create_deployment_manifest(self, api_credentials):
         """Return path to manifest file - use provided file from n8n or yaml content directly"""
-        # If a YAML file was provided (e.g., from n8n at /tmp/deploy.yaml), use it directly
+        # If a YAML file was provided (e.g., from n8n at /tmp/deploy.yaml), normalize denom and use temp file
         if self.yaml_file:
             self.logger.info(f"📄 Using provided YAML file: {self.yaml_file}")
-            return self.yaml_file
+            try:
+                with open(self.yaml_file, 'r') as f:
+                    manifest = yaml.safe_load(strip_cli_warnings(f.read()))
+                if not isinstance(manifest, dict):
+                    raise ValueError('YAML manifest must be a mapping/object')
+                manifest, changed = self._normalize_manifest_for_bme(manifest)
+                manifest_path = self._write_manifest_temp_file(manifest)
+                if changed:
+                    self.logger.info(f"🧩 Normalized manifest pricing denom to uact for BME compatibility: {manifest_path}")
+                return manifest_path
+            except Exception as e:
+                self.logger.warning(f"⚠️ Could not normalize YAML file, using original as-is: {e}")
+                return self.yaml_file
         
-        # If YAML content was provided as string, return it directly (provider-services can handle YAML content)
+        # If YAML content was provided as string, normalize denom and write to temp file
         if self.yaml_content:
             self.logger.info(f"📄 Using provided YAML content")
-            return self.yaml_content
+            try:
+                manifest = yaml.safe_load(strip_cli_warnings(self.yaml_content))
+                if not isinstance(manifest, dict):
+                    raise ValueError('YAML manifest must be a mapping/object')
+                manifest, changed = self._normalize_manifest_for_bme(manifest)
+                manifest_path = self._write_manifest_temp_file(manifest)
+                if changed:
+                    self.logger.info(f"🧩 Normalized manifest pricing denom to uact for BME compatibility: {manifest_path}")
+                return manifest_path
+            except Exception as e:
+                self.logger.warning(f"⚠️ Could not normalize YAML content, writing raw content to temp file: {e}")
+                temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', prefix='iwb-deploy-raw-', delete=False)
+                temp_file.write(self.yaml_content)
+                temp_file.close()
+                self._temp_manifest_files.append(temp_file.name)
+                return temp_file.name
         
         # Should not reach here in n8n workflow, but provide default if needed
         self.logger.warning("⚠️  No YAML provided, this should not happen in n8n workflow")
@@ -1307,8 +1691,14 @@ class AkashDeployer:
     def create_deployment(self):
         """Create deployment with resilient timeout handling"""
         self.logger.info("📦 Creating deployment...")
+        if not self.ensure_act_for_deployment(required_uact=DEFAULT_DEPLOYMENT_DEPOSIT_UACT):
+            return {'success': False, 'error': 'Insufficient ACT balance and failed to mint ACT for deployment deposit'}
+
         manifest_path = self.create_deployment_manifest(self.generate_api_credentials())
-        success, stdout, stderr = self.execute_tx(['tx', 'deployment', 'create', manifest_path])
+        success, stdout, stderr = self.execute_tx([
+            'tx', 'deployment', 'create', manifest_path,
+            '--deposit', f'{DEFAULT_DEPLOYMENT_DEPOSIT_UACT}uact'
+        ])
         
         # Check if this is a timeout error (transaction might still succeed)
         is_timeout = 'timed out waiting for tx' in stderr.lower() or 'timeout' in stderr.lower()
@@ -1331,7 +1721,14 @@ class AkashDeployer:
                     
                     if dseq:
                         self.logger.info(f"✅ Deployment was created successfully despite timeout: DSEQ {dseq}")
-                        deployment_info = {'dseq': dseq, 'owner': self.wallet_address, 'manifest_path': manifest_path}
+                        self.get_wallet_balance()
+                        deployment_info = {
+                            'dseq': dseq,
+                            'owner': self.wallet_address,
+                            'manifest_path': manifest_path,
+                            'act_conversion': self.last_act_conversion,
+                            'wallet_balances': {'uakt': self.balance_uakt, 'uact': self.balance_uact}
+                        }
                         self.save_state(deployment_info)
                         return {'success': True, 'deployment_info': deployment_info}
                     else:
@@ -1359,7 +1756,14 @@ class AkashDeployer:
                 return {'success': False, 'error': f'Failed to parse deployment output. Raw output: {stdout}'}
 
         self.logger.info(f"✅ Deployment created with DSEQ: {dseq}")
-        deployment_info = {'dseq': dseq, 'owner': self.wallet_address, 'manifest_path': manifest_path}
+        self.get_wallet_balance()
+        deployment_info = {
+            'dseq': dseq,
+            'owner': self.wallet_address,
+            'manifest_path': manifest_path,
+            'act_conversion': self.last_act_conversion,
+            'wallet_balances': {'uakt': self.balance_uakt, 'uact': self.balance_uact}
+        }
         self.save_state(deployment_info)
         return {'success': True, 'deployment_info': deployment_info}
 
@@ -2228,6 +2632,24 @@ class AkashDeployer:
             
             # Send deployment started notification email
             try:
+                self.get_wallet_balance()
+                act_conversion = result.get('deployment_info', {}).get('act_conversion', {}) or {}
+                if act_conversion.get('conversion_performed'):
+                    conversion_info = f"""ACT Conversion:
+- Status: Performed
+- Burned: {act_conversion.get('burned_akt', 0):.6f} AKT ({act_conversion.get('burned_uakt', 0)} uakt)
+- ACT Before: {act_conversion.get('act_balance_before_act', 0):.6f} ACT
+- ACT After: {act_conversion.get('act_balance_after_act', 0):.6f} ACT
+- ACT Minted (est): {act_conversion.get('minted_act_estimate', 0):.6f} ACT
+- ACT Minted (ledger): {act_conversion.get('minted_uact_from_ledger', 0) / 1000000:.6f} ACT
+- ACT Minted (bank delta): {act_conversion.get('minted_uact_from_balance', 0) / 1000000:.6f} ACT
+- ACT Effective Balance: {act_conversion.get('effective_act_balance_act', act_conversion.get('act_balance_after_act', 0)):.6f} ACT
+- Ledger Status: {act_conversion.get('ledger_status', 'unknown')}"""
+                else:
+                    conversion_info = f"""ACT Conversion:
+- Status: Not needed
+- Details: {act_conversion.get('message', 'No conversion metadata')}"""
+
                 subject = f"Akash Deployment {dseq} Started"
                 body = f"""ComfyUI Deployment Started
 
@@ -2241,6 +2663,12 @@ API Credentials:
 - Username: {api_credentials['username']}
 - Password: {api_credentials['password']}
 - API URL: {api_credentials['api_url']}
+
+{conversion_info}
+
+Wallet Balances (post-deployment-start):
+- AKT: {self.balance_uakt / 1000000:.6f} AKT ({self.balance_uakt} uakt)
+- ACT: {self.balance_uact / 1000000:.6f} ACT ({self.balance_uact} uact)
 
 The deployment is starting. Services will be available once fully initialized.
 Use --check-ready to monitor deployment status.
@@ -2270,6 +2698,7 @@ Use --check-ready to monitor deployment status.
     def close_deployment(self, dseq=None):
         """Close deployment"""
         try:
+            deployment_state_before_close = self.load_state() or {}
             if not dseq:
                 # Use helper to restore wallet and get deployment
                 success, deployment_info, error_response = self._ensure_wallet_and_deployment()
@@ -2345,6 +2774,24 @@ Use --check-ready to monitor deployment status.
                 
                 # Send closure notification
                 try:
+                    self.get_wallet_balance()
+                    act_conversion = deployment_state_before_close.get('act_conversion', {})
+                    if act_conversion.get('conversion_performed'):
+                        conversion_info = f"""ACT Conversion (from deployment start):
+- Status: Performed
+- Burned: {act_conversion.get('burned_akt', 0):.6f} AKT ({act_conversion.get('burned_uakt', 0)} uakt)
+- ACT Before: {act_conversion.get('act_balance_before_act', 0):.6f} ACT
+- ACT After: {act_conversion.get('act_balance_after_act', 0):.6f} ACT
+- ACT Minted (est): {act_conversion.get('minted_act_estimate', 0):.6f} ACT
+- ACT Minted (ledger): {act_conversion.get('minted_uact_from_ledger', 0) / 1000000:.6f} ACT
+- ACT Minted (bank delta): {act_conversion.get('minted_uact_from_balance', 0) / 1000000:.6f} ACT
+- ACT Effective Balance: {act_conversion.get('effective_act_balance_act', act_conversion.get('act_balance_after_act', 0)):.6f} ACT
+- Ledger Status: {act_conversion.get('ledger_status', 'unknown')}"""
+                    else:
+                        conversion_info = f"""ACT Conversion (from deployment start):
+- Status: Not recorded or not needed
+- Details: {act_conversion.get('message', 'No conversion metadata found')}"""
+
                     subject = f"Akash Deployment {dseq} Closed - Cost Report"
                     body = f"""Deployment Closure Report
 
@@ -2357,6 +2804,12 @@ Cost Analysis:
 - Total Cost: {total_cost_akt:.6f} AKT
 
 {usd_info}
+
+{conversion_info}
+
+Wallet Balances (post-close):
+- AKT: {self.balance_uakt / 1000000:.6f} AKT ({self.balance_uakt} uakt)
+- ACT: {self.balance_uact / 1000000:.6f} ACT ({self.balance_uact} uact)
 
 Deployment closed and wallet cleaned up.
 """

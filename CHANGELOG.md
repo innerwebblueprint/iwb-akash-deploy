@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.9] - 2026-03-28
+
 ### Added
 - **Certificate management CLI actions**:
   - `--cert-query` to query certificate status for wallet or `--cert-owner`
@@ -19,9 +21,13 @@ All notable changes to this project will be documented in this file.
 - **Deployment started email enhancement**: includes `Service URL` when available and always includes `API URL` with a clear pending message when URI is not yet available
 - **Certificate generation robustness**: certificate generation now uses `--overwrite` to avoid local cert-file collisions during regeneration/rotation
 - **README updates**: added certificate management command documentation and examples
+- **ACT mint validation hardened**: deployment ACT checks now use BME ledger execution records as source-of-truth when `bank balances` visibility lags
+- **Version consistency**: aligned package metadata version with runtime script version (`1.1.9`)
 
 ### Fixed
 - **Certificate revoke command syntax**: corrected to `tx cert revoke client --serial ...` (required by provider-services)
+- **False ACT insufficiency after successful mint**: `ensure_act_for_deployment()` now retries ledger lookup, parses executed mint output, and computes effective ACT sufficiency from ledger-confirmed minting
+- **ACT email reporting detail**: deployment-started and deployment-closed emails now include ledger mint amount, bank-delta mint amount, effective ACT balance, and ledger status
 
 ## [1.1.8] - 2025-11-02
 
