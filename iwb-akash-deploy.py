@@ -4,13 +4,14 @@ iwb-akash-deploy.py - Compact Akash Deployment Script
 Deploy AI compute instances to Akash Network, specifically designed for use within n8n workflows
 """
 
-__version__ = "1.1.9"
+__version__ = "1.1.10"
 
 import argparse
 import concurrent.futures
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -2564,8 +2565,12 @@ class AkashDeployer:
                 }
 
             # No existing deployment found, continue with checks for new deployment
-            if self.get_wallet_balance() < 1000000:
-                return self._error_response('Insufficient balance')
+            self.get_wallet_balance()
+            if self.balance_uakt < DEFAULT_AKT_GAS_RESERVE_UAKT:
+                return self._error_response(
+                    f'Insufficient AKT for transaction fees (need at least {DEFAULT_AKT_GAS_RESERVE_UAKT / 1000000:.2f} AKT reserve, '
+                    f'have {self.balance_uakt / 1000000:.2f} AKT)'
+                )
 
             if not self.setup_certificate():
                 return self._error_response('Certificate setup failed')
@@ -2707,6 +2712,26 @@ Use --check-ready to monitor deployment status.
                 
                 dseq = deployment_info.get('dseq') if deployment_info else None
 
+            pre_close_lease_cost_uact = None
+            try:
+                success_preclose, result_preclose = self.execute_query([
+                    'query', 'market', 'lease', 'list', '--owner', self.wallet_address, '--dseq', dseq
+                ])
+                if success_preclose and isinstance(result_preclose, dict):
+                    preclose_leases = result_preclose.get('leases', [])
+                    if preclose_leases:
+                        preclose_escrow = preclose_leases[0].get('escrow_payment', {})
+                        preclose_withdrawn = preclose_escrow.get('withdrawn', {})
+                        if isinstance(preclose_withdrawn, dict):
+                            preclose_withdrawn_amount = float(preclose_withdrawn.get('amount', 0))
+                            preclose_withdrawn_denom = preclose_withdrawn.get('denom', '')
+                            if preclose_withdrawn_denom == 'uact':
+                                pre_close_lease_cost_uact = preclose_withdrawn_amount
+                        else:
+                            pre_close_lease_cost_uact = float(preclose_withdrawn) if preclose_withdrawn else 0
+            except Exception as e:
+                self.logger.debug(f"Pre-close lease cost query failed (non-fatal): {e}")
+
             self.logger.info(f"🛑 Closing deployment {dseq}...")
             
             # Close the deployment first
@@ -2716,8 +2741,10 @@ Use --check-ready to monitor deployment status.
                 self.clear_state()
                 
                 # Extract transaction fee from close transaction
-                tx_fee_akt = 0.0
-                lease_cost_akt = 0.0
+                tx_fee_uakt = 0.0
+                unexpected_tx_fee_uact = 0.0
+                lease_cost_uact = 0.0
+                unexpected_lease_cost_uakt = 0.0
                 
                 try:
                     if stdout:
@@ -2726,51 +2753,82 @@ Use --check-ready to monitor deployment status.
                             fee_info = tx_data.get('tx', {}).get('auth_info', {}).get('fee', {})
                             for amount in fee_info.get('amount', []):
                                 if amount.get('denom') == 'uakt':
-                                    tx_fee_akt = float(amount['amount']) / 1000000
-                                    break
+                                    tx_fee_uakt += float(amount.get('amount', 0))
+                                elif amount.get('denom') == 'uact':
+                                    unexpected_tx_fee_uact += float(amount.get('amount', 0))
                 except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
                     pass
                 
                 # Wait for blockchain confirmation then query actual lease cost
-                self.logger.info("� Waiting for blockchain confirmation...")
+                self.logger.info("⏳ Waiting for blockchain confirmation...")
                 time.sleep(3)
-                
+
                 self.logger.info("🔍 Querying lease for actual cost...")
-                try:
-                    success_query, result = self.execute_query([
-                        'query', 'market', 'lease', 'list', '--owner', self.wallet_address, '--dseq', dseq
-                    ])
-                    if success_query and isinstance(result, dict):
-                        leases = result.get('leases', [])
-                        if leases:
-                            escrow = leases[0].get('escrow_payment', {})
-                            withdrawn = escrow.get('withdrawn', {})
-                            if isinstance(withdrawn, dict):
-                                withdrawn_uakt = float(withdrawn.get('amount', 0))
+                for attempt in range(1, 4):
+                    try:
+                        success_query, result = self.execute_query([
+                            'query', 'market', 'lease', 'list', '--owner', self.wallet_address, '--dseq', dseq
+                        ])
+                        if success_query and isinstance(result, dict):
+                            leases = result.get('leases', [])
+                            if leases:
+                                escrow = leases[0].get('escrow_payment', {})
+                                withdrawn = escrow.get('withdrawn', {})
+                                if isinstance(withdrawn, dict):
+                                    withdrawn_amount = float(withdrawn.get('amount', 0))
+                                    withdrawn_denom = withdrawn.get('denom', '')
+                                    if withdrawn_denom == 'uact':
+                                        lease_cost_uact = withdrawn_amount
+                                    elif withdrawn_denom == 'uakt':
+                                        unexpected_lease_cost_uakt = withdrawn_amount
+                                else:
+                                    lease_cost_uact = float(withdrawn) if withdrawn else 0
+                                if lease_cost_uact > 0:
+                                    self.logger.info(f"💰 Lease cost (deployment spend): {lease_cost_uact / 1000000:.6f} ACT")
+                                elif unexpected_lease_cost_uakt > 0:
+                                    self.logger.warning(
+                                        f"⚠️ Lease cost returned in unexpected denom uakt: {unexpected_lease_cost_uakt / 1000000:.6f} AKT"
+                                    )
+                                break
                             else:
-                                withdrawn_uakt = float(withdrawn) if withdrawn else 0
-                            lease_cost_akt = withdrawn_uakt / 1000000
-                            self.logger.info(f"💰 Lease cost: {lease_cost_akt:.6f} AKT")
+                                self.logger.warning(f"⚠️ No lease information found on attempt {attempt}/3")
                         else:
-                            self.logger.warning("⚠️ No lease information found")
-                except Exception as e:
-                    self.logger.warning(f"⚠️ Could not query lease cost: {e}")
+                            self.logger.warning(f"⚠️ Lease query failed on attempt {attempt}/3: {result}")
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ Could not query lease cost on attempt {attempt}/3: {e}")
+
+                    if attempt < 3 and lease_cost_uact <= 0 and unexpected_lease_cost_uakt <= 0:
+                        time.sleep(2)
+
+                if lease_cost_uact <= 0 and pre_close_lease_cost_uact is not None:
+                    lease_cost_uact = pre_close_lease_cost_uact
+                    self.logger.info(f"ℹ️ Using pre-close lease cost fallback: {lease_cost_uact / 1000000:.6f} ACT")
+
+                deployment_cost_act = lease_cost_uact / 1_000_000
+                gas_fee_akt = tx_fee_uakt / 1_000_000
                 
-                # Calculate total cost
-                total_cost_akt = lease_cost_akt + tx_fee_akt
-                
-                # Get AKT price for USD conversion
+                # Get AKT price for USD conversion (gas fee only)
                 akt_price = self.get_akt_price()
                 if akt_price:
-                    lease_cost_usd = lease_cost_akt * akt_price
-                    tx_fee_usd = tx_fee_akt * akt_price
-                    total_cost_usd = total_cost_akt * akt_price
-                    usd_info = f"""- Lease Cost: ${lease_cost_usd:.2f} USD
-- Transaction Fee: ${tx_fee_usd:.2f} USD
-- Total Cost: ${total_cost_usd:.2f} USD
-- AKT/USD Rate: ${akt_price:.2f}"""
+                    gas_fee_usd = gas_fee_akt * akt_price
+                    usd_info = f"""- Gas Fee (AKT) USD: ${gas_fee_usd:.2f}
+- AKT/USD Rate: ${akt_price:.2f}
+- Note: Lease/deployment spend is ACT-denominated"""
                 else:
                     usd_info = "- USD conversion: Not available (API unavailable)"
+
+                cost_lines = [
+                    "Cost Analysis:",
+                    f"- Deployment Cost: {deployment_cost_act:.6f} ACT",
+                    f"- Gas Fee: {gas_fee_akt:.6f} AKT",
+                ]
+
+                if unexpected_lease_cost_uakt > 0:
+                    cost_lines.append(f"- Warning: Unexpected lease denom uakt observed: {unexpected_lease_cost_uakt / 1000000:.6f} AKT")
+                if unexpected_tx_fee_uact > 0:
+                    cost_lines.append(f"- Warning: Unexpected tx fee denom uact observed: {unexpected_tx_fee_uact / 1000000:.6f} ACT")
+
+                cost_summary = "\n".join(cost_lines)
                 
                 # Send closure notification
                 try:
@@ -2798,10 +2856,7 @@ Use --check-ready to monitor deployment status.
 DSEQ: {dseq}
 Closed: {datetime.now(timezone.utc).isoformat()}Z
 
-Cost Analysis:
-- Lease Cost: {lease_cost_akt:.6f} AKT
-- Transaction Fee: {tx_fee_akt:.6f} AKT
-- Total Cost: {total_cost_akt:.6f} AKT
+{cost_summary}
 
 {usd_info}
 
@@ -2813,11 +2868,29 @@ Wallet Balances (post-close):
 
 Deployment closed and wallet cleaned up.
 """
-                    self.send_email(subject, body)
+                    email_sent = self.send_email(subject, body)
+                    if email_sent:
+                        self.logger.info("✅ Close notification email sent")
+                    else:
+                        self.logger.error("❌ Close notification email failed to send")
                 except Exception as e:
                     self.logger.warning(f"⚠️ Could not send closure notification: {e}")
+                    email_sent = False
                 
-                return {'success': True, 'message': f'Deployment {dseq} closed', 'dseq': dseq}
+                return {
+                    'success': True,
+                    'message': f'Deployment {dseq} closed',
+                    'dseq': dseq,
+                    'cost_report': {
+                        'lease_cost_uact': lease_cost_uact,
+                        'deployment_cost_act': deployment_cost_act,
+                        'tx_fee_uakt': tx_fee_uakt,
+                        'gas_fee_akt': gas_fee_akt,
+                        'unexpected_lease_cost_uakt': unexpected_lease_cost_uakt,
+                        'unexpected_tx_fee_uact': unexpected_tx_fee_uact,
+                    },
+                    'email_sent': email_sent
+                }
             return {'success': False, 'error': 'Deployment closure failed'}
         
         finally:
@@ -2870,14 +2943,81 @@ Deployment closed and wallet cleaned up.
             '--keyring-backend', AKASH_KEYRING_BACKEND, '--from', AKASH_WALLET_NAME,
             '--node', self.akash_node, '--auth-type', 'mtls'
         ]
-        
+
         if follow:
             cmd.append('-f')
-        else:
-            cmd.extend(['--tail', str(tail_lines)])
+            return self._stream_lease_logs(cmd, dseq, provider)
 
+        cmd.extend(['--tail', str(tail_lines)])
         stdout, stderr, rc = self.run_command(cmd, timeout=30)
-        return {'success': rc == 0, 'dseq': dseq, 'provider': provider, 'logs': stdout if rc == 0 else stderr}
+        if rc == 0:
+            return {
+                'success': True,
+                'dseq': dseq,
+                'provider': provider,
+                'logs': self._clean_lease_logs_output(stdout)
+            }
+
+        return {'success': False, 'dseq': dseq, 'provider': provider, 'error': stderr}
+
+    def _clean_lease_log_line(self, line):
+        """Remove noisy Akash lease-log prefixes for better readability"""
+        if not isinstance(line, str):
+            return line
+
+        cleaned = line.rstrip('\n')
+        cleaned = cleaned.replace('\\n', '')
+        cleaned = re.sub(r'^(?:\[[^\]]+\])+\s*', '', cleaned)
+        return cleaned
+
+    def _clean_lease_logs_output(self, output):
+        """Clean multi-line lease log output"""
+        if not isinstance(output, str):
+            return output
+
+        cleaned_lines = []
+        for line in output.splitlines():
+            cleaned = self._clean_lease_log_line(line)
+            if cleaned:
+                cleaned_lines.append(cleaned)
+        return '\n'.join(cleaned_lines)
+
+    def _stream_lease_logs(self, cmd, dseq, provider):
+        """Continuously stream lease logs with cleaned prefixes until interrupted"""
+        self.logger.info(f"📡 Tailing lease logs for deployment {dseq} (Ctrl+C to stop)...")
+        process = None
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
+            )
+
+            if process.stdout:
+                for line in process.stdout:
+                    cleaned = self._clean_lease_log_line(line)
+                    if cleaned:
+                        print(cleaned)
+
+            rc = process.wait()
+            if rc == 0:
+                return {'success': True, 'dseq': dseq, 'provider': provider, 'message': 'Log tail ended'}
+
+            stderr_text = ''
+            if process.stderr:
+                stderr_text = process.stderr.read()
+            return {'success': False, 'dseq': dseq, 'provider': provider, 'error': stderr_text or 'lease-logs failed'}
+
+        except KeyboardInterrupt:
+            if process and process.poll() is None:
+                process.terminate()
+            return {'success': True, 'dseq': dseq, 'provider': provider, 'message': 'Log tail stopped by user'}
+        except Exception as e:
+            if process and process.poll() is None:
+                process.terminate()
+            return {'success': False, 'dseq': dseq, 'provider': provider, 'error': str(e)}
 
     def get_interactive_shell(self, service_name='comfyui'):
         """Get interactive shell into the container"""
@@ -2931,8 +3071,14 @@ Deployment closed and wallet cleaned up.
                     'error': 'Wallet restoration failed'
                 }
 
-            # Check balance
-            balance_sufficient = self.get_wallet_balance() > 1000000
+            # Check balances for deployment viability
+            self.get_wallet_balance()
+            required_deposit_uact = DEFAULT_DEPLOYMENT_DEPOSIT_UACT
+            required_fee_reserve_uakt = DEFAULT_AKT_GAS_RESERVE_UAKT
+
+            act_deposit_sufficient = self.balance_uact >= required_deposit_uact
+            akt_fee_reserve_sufficient = self.balance_uakt >= required_fee_reserve_uakt
+            balance_sufficient = act_deposit_sufficient and akt_fee_reserve_sufficient
             
             # Check certificate (both on-chain and local file)
             self.logger.info("🔐 Checking certificate status...")
@@ -2969,6 +3115,8 @@ Deployment closed and wallet cleaned up.
             checks = {
                 'wallet': True,
                 'balance': balance_sufficient,
+                'act_deposit': act_deposit_sufficient,
+                'akt_fee_reserve': akt_fee_reserve_sufficient,
                 'certificate': cert_ready,
                 'certificate_on_chain': cert_on_chain,
                 'certificate_local': local_cert_exists,
@@ -2999,7 +3147,12 @@ Deployment closed and wallet cleaned up.
                 'cost_estimate': {
                     'estimated_cost_akt': 0.5,
                     'current_balance_akt': self.balance_uakt / 1000000,
-                    'sufficient_funds': checks['balance']
+                    'current_balance_act': self.balance_uact / 1000000,
+                    'required_deposit_act': required_deposit_uact / 1000000,
+                    'required_fee_reserve_akt': required_fee_reserve_uakt / 1000000,
+                    'sufficient_funds': checks['balance'],
+                    'act_deposit_sufficient': act_deposit_sufficient,
+                    'akt_fee_reserve_sufficient': akt_fee_reserve_sufficient
                 }
             }
             
@@ -3017,6 +3170,7 @@ def main():
     parser.add_argument('--close', action='store_true', help='Close active deployment')
     parser.add_argument('--status', action='store_true', help='Check lease status')
     parser.add_argument('--logs', action='store_true', help='View deployment logs')
+    parser.add_argument('--log-tail', action='store_true', help='Continuously tail deployment logs (Ctrl+C to stop)')
     parser.add_argument('--shell', action='store_true', help='Get interactive shell into container')
     parser.add_argument('--rpc-info', action='store_true', help='Show RPC info')
     parser.add_argument('--cert-query', action='store_true', help='Query certificate status for wallet or --cert-owner address')
@@ -3037,6 +3191,7 @@ def main():
         args.close,
         args.status,
         args.logs,
+        args.log_tail,
         args.shell,
         args.cert_query,
         args.cert_add,
@@ -3103,6 +3258,8 @@ def main():
             result = deployer.get_lease_status()
         elif args.logs:
             result = deployer.get_lease_logs()
+        elif args.log_tail:
+            result = deployer.get_lease_logs(follow=True)
         elif args.shell:
             # Note: get_interactive_shell() uses os.execvp and won't return
             result = deployer.get_interactive_shell()

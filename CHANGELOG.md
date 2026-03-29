@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.1.10] - 2026-03-28
+
+### Added
+- **Continuous log tailing**: added `--log-tail` to stream lease logs live until interrupted (`Ctrl+C`)
+
+### Changed
+- **Cleaner lease log output**: `--logs` and `--log-tail` now strip noisy Akash lease prefixes (`[owner/dseq/gseq/oseq/provider][pod]`) so progress lines are easier to read
+- **Log command behavior**: `--logs` remains a recent-tail snapshot while `--log-tail` is the dedicated follow mode for ongoing monitoring
+
 ## [1.1.9] - 2026-03-28
 
 ### Added

@@ -1,6 +1,6 @@
 [project]
 name = "iwb-akash-deploy"
-version = "1.1.9"
+version = "1.1.10"
 description = "Automaticlly Deploy ComfyUI instances to Akash Network."
 authors = [
     {name = "IWB Team", email = "info@innerwebblueprint.com"}
